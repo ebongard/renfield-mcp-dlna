@@ -54,7 +54,7 @@ async def _ensure_infrastructure() -> None:
         requester=_requester,
         source=(source_ip, 0),  # OS picks free port
     )
-    _event_handler = UpnpEventHandler(_requester, _notify_server)
+    _event_handler = UpnpEventHandler(_notify_server, _requester)
     _factory = UpnpFactory(_requester)
     await _notify_server.async_start_server()
     logger.info(
