@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "renfield-mcp-dlna"
+version = "0.1.0"
+description = "MCP server for DLNA media renderer control with gapless queue playback."
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.11"
+dependencies = [
+    "mcp>=1.26.0",
+    "async-upnp-client>=0.40.0",
+    "python-didl-lite>=1.4.0",
+    "aiohttp>=3.9.0",
+]
+
+[project.scripts]
+renfield-mcp-dlna = "renfield_mcp_dlna.server:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["renfield_mcp_dlna*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
