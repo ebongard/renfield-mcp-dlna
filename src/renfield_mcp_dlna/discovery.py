@@ -44,14 +44,14 @@ _renderer_cache: list[DlnaRenderer] = []
 _cache_time: float = 0
 
 
-def _build_msearch() -> bytes:
+def _build_msearch(search_target: str = _SEARCH_TARGET) -> bytes:
     """Build an SSDP M-SEARCH request."""
     return (
         "M-SEARCH * HTTP/1.1\r\n"
         f"HOST: {_SSDP_ADDR}:{_SSDP_PORT}\r\n"
         'MAN: "ssdp:discover"\r\n'
-        "MX: 3\r\n"
-        f"ST: {_SEARCH_TARGET}\r\n"
+        "MX: 5\r\n"
+        f"ST: {search_target}\r\n"
         "\r\n"
     ).encode("utf-8")
 
@@ -72,10 +72,12 @@ def _base_url_from_location(location: str) -> str:
     return f"{parsed.scheme}://{parsed.netloc}"
 
 
-async def _ssdp_search(timeout: float = 4.0) -> list[str]:
-    """Send SSDP M-SEARCH and collect LOCATION URLs."""
+async def _ssdp_search_single(
+    search_target: str, timeout: float = 6.0
+) -> list[str]:
+    """Send SSDP M-SEARCH for a single ST and collect LOCATION URLs."""
     locations: list[str] = []
-    msg = _build_msearch()
+    msg = _build_msearch(search_target)
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -84,7 +86,9 @@ async def _ssdp_search(timeout: float = 4.0) -> list[str]:
         socket.IP_MULTICAST_TTL,
         struct.pack("b", 4),
     )
-    sock.setblocking(False)
+    # Keep socket blocking — recv is run in executor thread.
+    # select() provides the timeout; recv() blocks until data arrives.
+    sock.setblocking(True)
 
     loop = asyncio.get_running_loop()
 
@@ -95,16 +99,28 @@ async def _ssdp_search(timeout: float = 4.0) -> list[str]:
         )
         await asyncio.sleep(0.1)
 
+    import select
+
+    def _recv_with_select(s: socket.socket, wait: float) -> bytes | None:
+        """Block up to *wait* seconds for data using select()."""
+        ready, _, _ = select.select([s], [], [], wait)
+        if ready:
+            return s.recv(4096)
+        return None
+
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
+        wait = min(remaining, 1.0)
         try:
             data = await asyncio.wait_for(
-                loop.run_in_executor(None, lambda: sock.recv(4096)),
-                timeout=min(remaining, 1.0),
+                loop.run_in_executor(None, _recv_with_select, sock, wait),
+                timeout=wait + 0.5,  # small grace for thread scheduling
             )
+            if data is None:
+                continue  # select timed out, keep waiting
             loc = _parse_location(data.decode("utf-8", errors="ignore"))
             if loc and loc not in locations:
                 locations.append(loc)
@@ -114,6 +130,28 @@ async def _ssdp_search(timeout: float = 4.0) -> list[str]:
             break
 
     sock.close()
+    return locations
+
+
+async def _ssdp_search(timeout: float = 5.0) -> list[str]:
+    """Send SSDP M-SEARCH for MediaRenderer and rootdevice, merge results.
+
+    Some devices (e.g. Linn/ohNet) don't respond to the MediaRenderer search
+    target but do support AVTransport. Searching for upnp:rootdevice as well
+    catches these devices.  Filtering by AVTransport happens later.
+    """
+    results = await asyncio.gather(
+        _ssdp_search_single(_SEARCH_TARGET, timeout),
+        _ssdp_search_single("upnp:rootdevice", timeout),
+    )
+    # Merge and deduplicate
+    seen: set[str] = set()
+    locations: list[str] = []
+    for loc_list in results:
+        for loc in loc_list:
+            if loc not in seen:
+                seen.add(loc)
+                locations.append(loc)
     return locations
 
 
@@ -137,11 +175,13 @@ async def _fetch_device_description(
 
     device = root.find(f"{{{_NS_DEVICE}}}device")
     if device is None:
+        logger.debug(f"No <device> element in {location}")
         return None
 
     friendly_name = device.findtext(f"{{{_NS_DEVICE}}}friendlyName", "")
     udn = device.findtext(f"{{{_NS_DEVICE}}}UDN", "")
     if not udn:
+        logger.debug(f"No UDN for device '{friendly_name}' at {location}")
         return None
 
     base_url = _base_url_from_location(location)
@@ -150,6 +190,7 @@ async def _fetch_device_description(
 
     service_list = device.find(f"{{{_NS_DEVICE}}}serviceList")
     if service_list is None:
+        logger.debug(f"No serviceList for '{friendly_name}' at {location}")
         return None
 
     for service in service_list.findall(f"{{{_NS_DEVICE}}}service"):
@@ -167,6 +208,7 @@ async def _fetch_device_description(
             rc_control_url = control_url or ""
 
     if not av_control_url:
+        logger.debug(f"No AVTransport service for '{friendly_name}' at {location}")
         return None
 
     # Resolve relative URLs

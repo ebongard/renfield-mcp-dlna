@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 import sys
 
 from mcp.server.fastmcp import FastMCP
@@ -17,17 +18,23 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-mcp = FastMCP("renfield-dlna")
+mcp = FastMCP(
+    "renfield-dlna",
+    host=os.getenv("MCP_HOST", "0.0.0.0"),
+    port=int(os.getenv("MCP_PORT", "9091")),
+)
 
 
 @mcp.tool()
-async def list_renderers() -> dict:
+async def list_renderers(force_refresh: bool = False) -> dict:
     """Discover DLNA media renderers on the network.
 
     Returns name and supports_queue flag for each renderer.
-    Use force_refresh=true to bypass the 5-minute cache.
+
+    Args:
+        force_refresh: If true, bypass the 5-minute cache and rescan the network.
     """
-    renderers = await discovery.discover_renderers(force=False)
+    renderers = await discovery.discover_renderers(force=force_refresh)
     items = [
         {
             "name": r.name,
@@ -205,8 +212,23 @@ async def set_volume(renderer_name: str, volume: int) -> dict:
 
 
 def main():
-    """Entry point for console script and python -m."""
-    mcp.run(transport="stdio")
+    """Entry point for console script and python -m.
+
+    Transport is selected via MCP_TRANSPORT env var:
+      - "stdio" (default): MCP stdio protocol over stdin/stdout
+      - "streamable-http": HTTP server for remote connections
+
+    For streamable-http, set MCP_PORT (default: 9091) and MCP_HOST (default: 0.0.0.0).
+    """
+    transport = os.getenv("MCP_TRANSPORT", "stdio")
+
+    if transport == "streamable-http":
+        logger.info(
+            f"Starting DLNA MCP server on {mcp.settings.host}:{mcp.settings.port} (streamable-http)"
+        )
+        mcp.run(transport="streamable-http")
+    else:
+        mcp.run(transport="stdio")
 
 
 if __name__ == "__main__":
