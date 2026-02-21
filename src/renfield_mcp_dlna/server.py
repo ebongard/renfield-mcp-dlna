@@ -121,6 +121,42 @@ async def stop(renderer_name: str) -> dict:
 
 
 @mcp.tool()
+async def pause(renderer_name: str) -> dict:
+    """Pause playback on a DLNA renderer."""
+    renderer = await discovery.find_renderer(renderer_name)
+    if not renderer:
+        return {"error": f"Renderer '{renderer_name}' not found"}
+
+    session = queue_manager.get_session(renderer.udn)
+    if not session:
+        return {"error": f"No active playback on '{renderer.name}'"}
+
+    try:
+        await session.pause()
+        return {"success": True, "renderer": renderer.name, "action": "paused"}
+    except Exception as e:
+        return {"error": f"Pause failed: {e}"}
+
+
+@mcp.tool()
+async def resume(renderer_name: str) -> dict:
+    """Resume playback on a DLNA renderer."""
+    renderer = await discovery.find_renderer(renderer_name)
+    if not renderer:
+        return {"error": f"Renderer '{renderer_name}' not found"}
+
+    session = queue_manager.get_session(renderer.udn)
+    if not session:
+        return {"error": f"No active playback on '{renderer.name}'"}
+
+    try:
+        await session.resume()
+        return {"success": True, "renderer": renderer.name, "action": "resumed"}
+    except Exception as e:
+        return {"error": f"Resume failed: {e}"}
+
+
+@mcp.tool()
 async def next_track(renderer_name: str) -> dict:
     """Skip to the next track in the queue."""
     renderer = await discovery.find_renderer(renderer_name)

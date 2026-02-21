@@ -266,6 +266,18 @@ class QueueSession:
         logger.info(f"[{self.renderer.name}] Stopped and cleaned up")
         await self._cleanup()
 
+    async def pause(self) -> None:
+        """Pause playback."""
+        if self._dmr is None:
+            raise RuntimeError("No active playback session")
+        await self._dmr.async_pause()
+
+    async def resume(self) -> None:
+        """Resume playback."""
+        if self._dmr is None:
+            raise RuntimeError("No active playback session")
+        await self._dmr.async_play()
+
     async def set_volume(self, volume: int) -> None:
         """Set playback volume (0-100)."""
         if self._dmr is None:
