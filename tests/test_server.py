@@ -381,6 +381,7 @@ class TestTrackDataclass:
         assert track.artist == ""
         assert track.album == ""
         assert track.art_url == ""
+        assert track.media_type == "audio"
 
     def test_full_track(self):
         track = Track(
@@ -392,3 +393,84 @@ class TestTrackDataclass:
         )
         assert track.title == "Cold as Ice"
         assert track.artist == "Foreigner"
+
+    def test_video_media_type(self):
+        track = Track(url="http://example.com/video.mp4", media_type="video")
+        assert track.media_type == "video"
+
+
+# ---------------------------------------------------------------------------
+# Video DIDL-Lite Tests
+# ---------------------------------------------------------------------------
+
+class TestBuildVideoDidlMetadata:
+    def test_valid_video_xml(self):
+        from renfield_mcp_dlna.didl import build_video_didl_metadata
+        xml = build_video_didl_metadata("http://jellyfin/Videos/m1/stream")
+        assert "DIDL-Lite" in xml
+        assert "http://jellyfin/Videos/m1/stream" in xml
+        assert "video/mp4" in xml
+        assert "object.item.videoItem.movie" in xml
+
+    def test_video_with_title(self):
+        from renfield_mcp_dlna.didl import build_video_didl_metadata
+        xml = build_video_didl_metadata(
+            "http://jellyfin/Videos/m1/stream",
+            title="Interstellar",
+        )
+        assert "Interstellar" in xml
+
+    def test_video_with_custom_mime_type(self):
+        from renfield_mcp_dlna.didl import build_video_didl_metadata
+        xml = build_video_didl_metadata(
+            "http://jellyfin/Videos/m1/stream",
+            title="Interstellar",
+            mime_type="video/x-matroska",
+        )
+        assert "video/x-matroska" in xml
+
+    def test_video_returns_valid_xml(self):
+        from xml.etree import ElementTree as ET
+        from renfield_mcp_dlna.didl import build_video_didl_metadata
+        xml = build_video_didl_metadata("http://example.com/video.mp4", title="Test")
+        ET.fromstring(xml)
+
+
+# ---------------------------------------------------------------------------
+# Video Track Playback Tests
+# ---------------------------------------------------------------------------
+
+class TestPlayTracksVideo:
+    async def test_video_track_parsed(self):
+        """Video track with media_type='video' is parsed correctly."""
+        renderer = _make_renderer()
+        tracks_json = json.dumps([
+            {"url": "http://jellyfin/Videos/m1/stream", "title": "Interstellar", "media_type": "video"},
+        ])
+
+        mock_session = MagicMock(spec=QueueSession)
+        with (
+            patch.object(discovery, "find_renderer", new_callable=AsyncMock, return_value=renderer),
+            patch.object(queue_manager, "play_tracks", new_callable=AsyncMock, return_value=mock_session) as mock_play,
+        ):
+            result = await server.play_tracks("HiFiBerry", tracks_json)
+            assert result.get("success") is True
+            tracks_passed = mock_play.call_args.args[1]
+            assert tracks_passed[0].media_type == "video"
+
+    async def test_backward_compat_no_media_type(self):
+        """Tracks without media_type field default to 'audio'."""
+        renderer = _make_renderer()
+        tracks_json = json.dumps([
+            {"url": "http://jellyfin/Audio/a1/stream", "title": "Song 1"},
+        ])
+
+        mock_session = MagicMock(spec=QueueSession)
+        with (
+            patch.object(discovery, "find_renderer", new_callable=AsyncMock, return_value=renderer),
+            patch.object(queue_manager, "play_tracks", new_callable=AsyncMock, return_value=mock_session) as mock_play,
+        ):
+            result = await server.play_tracks("HiFiBerry", tracks_json)
+            assert result.get("success") is True
+            tracks_passed = mock_play.call_args.args[1]
+            assert tracks_passed[0].media_type == "audio"

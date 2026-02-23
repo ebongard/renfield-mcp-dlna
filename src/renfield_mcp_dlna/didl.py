@@ -42,3 +42,26 @@ def build_didl_metadata(
 
     item = didl_lite.MusicTrack(**kwargs)
     return didl_lite.to_xml_string(item).decode("utf-8")
+
+
+def build_video_didl_metadata(
+    url: str,
+    title: str = "",
+    mime_type: str = "video/mp4",
+) -> str:
+    """Return a DIDL-Lite XML string for a video item (Movie).
+
+    Used for SetAVTransportURI when playing video content on DLNA
+    renderers (Smart TVs).
+    """
+    protocol_info = f"http-get:*:{mime_type}:*"
+    resource = didl_lite.Resource(uri=url, protocol_info=protocol_info)
+
+    item = didl_lite.Movie(
+        id="0",
+        parent_id="-1",
+        title=title or "Unknown",
+        restricted="1",
+        resources=[resource],
+    )
+    return didl_lite.to_xml_string(item).decode("utf-8")

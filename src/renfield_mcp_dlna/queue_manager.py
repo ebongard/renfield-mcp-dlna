@@ -81,6 +81,7 @@ class Track:
     artist: str = ""
     album: str = ""
     art_url: str = ""
+    media_type: str = "audio"  # "audio" or "video"
 
 
 class QueueSession:
@@ -97,6 +98,13 @@ class QueueSession:
         self._dmr: DmrDevice | None = None
         self._preloaded_index: int | None = None
 
+    def _build_metadata(self, track: Track) -> str:
+        """Build DIDL-Lite metadata based on track media type."""
+        if track.media_type == "video":
+            from .didl import build_video_didl_metadata
+            return build_video_didl_metadata(track.url, track.title)
+        return build_didl_metadata(track.url, track.title, track.artist, track.album, track.art_url)
+
     async def start(self) -> None:
         """Subscribe to events, play track 1, preload track 2."""
         await _ensure_infrastructure()
@@ -112,9 +120,7 @@ class QueueSession:
 
         # Play first track
         track = self.tracks[0]
-        metadata = build_didl_metadata(
-            track.url, track.title, track.artist, track.album, track.art_url
-        )
+        metadata = self._build_metadata(track)
         await self._dmr.async_set_transport_uri(track.url, track.title, metadata)
         await self._dmr.async_play()
         logger.info(f"[{self.renderer.name}] Playing track 1/{len(self.tracks)}: {track.title}")
@@ -174,9 +180,7 @@ class QueueSession:
         self.current_index += 1
         self._preloaded_index = None
         track = self.tracks[self.current_index]
-        metadata = build_didl_metadata(
-            track.url, track.title, track.artist, track.album, track.art_url
-        )
+        metadata = self._build_metadata(track)
         try:
             assert self._dmr is not None
             await self._dmr.async_set_transport_uri(track.url, track.title, metadata)
@@ -197,9 +201,7 @@ class QueueSession:
             return
 
         track = self.tracks[next_idx]
-        metadata = build_didl_metadata(
-            track.url, track.title, track.artist, track.album, track.art_url
-        )
+        metadata = self._build_metadata(track)
         try:
             await self._dmr.async_set_next_transport_uri(
                 track.url, track.title, metadata
@@ -219,9 +221,7 @@ class QueueSession:
         self.current_index += 1
         self._preloaded_index = None
         track = self.tracks[self.current_index]
-        metadata = build_didl_metadata(
-            track.url, track.title, track.artist, track.album, track.art_url
-        )
+        metadata = self._build_metadata(track)
         assert self._dmr is not None
         await self._dmr.async_set_transport_uri(track.url, track.title, metadata)
         await self._dmr.async_play()
@@ -239,9 +239,7 @@ class QueueSession:
         self.current_index -= 1
         self._preloaded_index = None
         track = self.tracks[self.current_index]
-        metadata = build_didl_metadata(
-            track.url, track.title, track.artist, track.album, track.art_url
-        )
+        metadata = self._build_metadata(track)
         assert self._dmr is not None
         await self._dmr.async_set_transport_uri(track.url, track.title, metadata)
         await self._dmr.async_play()
