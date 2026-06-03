@@ -584,7 +584,8 @@ class TestQueryTransportState:
 
     async def test_query_bounded_by_timeout(self, monkeypatch):
         # A hung renderer must not block get_status: async_update is wrapped in
-        # asyncio.wait_for, so an overrunning poll returns None within budget.
+        # asyncio.wait_for. With no known transport_state, the poll returns None
+        # within budget rather than waiting out the hang.
         monkeypatch.setattr(queue_manager, "_TRANSPORT_POLL_TIMEOUT", 0.01)
 
         async def _hang():
@@ -593,6 +594,7 @@ class TestQueryTransportState:
         s = QueueSession(_make_renderer(), _make_tracks(1))
         dmr = MagicMock()
         dmr.async_update = _hang
+        dmr.transport_state = None
         s._dmr = dmr
         assert await s._query_transport_state() is None
 
@@ -601,12 +603,25 @@ class TestQueryTransportState:
         assert s._dmr is None
         assert await s._query_transport_state() is None
 
-    async def test_query_swallows_poll_error(self):
+    async def test_query_returns_none_on_error_without_known_state(self):
         s = QueueSession(_make_renderer(), _make_tracks(1))
         dmr = MagicMock()
         dmr.async_update = AsyncMock(side_effect=RuntimeError("upnp timeout"))
+        dmr.transport_state = None
         s._dmr = dmr
         assert await s._query_transport_state() is None
+
+    async def test_query_falls_back_to_subscription_state_on_error(self):
+        # Even if the active refresh raises, the lib keeps transport_state fresh
+        # from the event subscription — report it instead of blanking to None.
+        from async_upnp_client.profiles.dlna import TransportState
+
+        s = QueueSession(_make_renderer(), _make_tracks(1))
+        dmr = MagicMock()
+        dmr.async_update = AsyncMock(side_effect=RuntimeError("upnp timeout"))
+        dmr.transport_state = TransportState.PLAYING
+        s._dmr = dmr
+        assert await s._query_transport_state() == "PLAYING"
 
     async def test_refresh_state_updates_status(self):
         s = QueueSession(_make_renderer(), _make_tracks(1))
@@ -623,3 +638,102 @@ class TestQueryTransportState:
         s._query_transport_state = AsyncMock(return_value=None)
         await s.refresh_state()
         assert s._transport_state == "PLAYING"  # untouched
+
+
+class _SV:
+    """Minimal stand-in for async_upnp_client's UpnpStateVariable."""
+
+    def __init__(self, name, value):
+        self.name = name
+        self.value = value
+
+
+class TestOnEvent:
+    """async_upnp_client delivers LAST_CHANGE as a LIST of UpnpStateVariable
+    objects — the old code called .get() on it and crashed, so TransportState
+    was never captured (status stuck on 'unknown') and gapless/auto-advance
+    detection silently never fired."""
+
+    def test_list_of_state_variables_sets_transport_state(self):
+        s = QueueSession(_make_renderer(), _make_tracks(1))
+        s._dmr = MagicMock()
+        s._on_event(MagicMock(), [_SV("TransportState", "PLAYING"), _SV("TransportStatus", "OK")])
+        assert s._transport_state == "PLAYING"
+        assert s.status()["state"] == "playing"
+
+    def test_dict_shape_tolerated(self):
+        s = QueueSession(_make_renderer(), _make_tracks(1))
+        s._dmr = MagicMock()
+        s._on_event(MagicMock(), {"TransportState": "PAUSED_PLAYBACK"})
+        assert s._transport_state == "PAUSED_PLAYBACK"
+
+    def test_empty_event_is_noop(self):
+        s = QueueSession(_make_renderer(), _make_tracks(1))
+        s._on_event(MagicMock(), [])  # must not raise
+        s._on_event(MagicMock(), None)
+        assert s._transport_state is None
+
+    def test_list_without_transport_state_leaves_state(self):
+        s = QueueSession(_make_renderer(), _make_tracks(1))
+        s._dmr = MagicMock()
+        s._transport_state = "PLAYING"
+        s._on_event(MagicMock(), [_SV("Volume", 28), _SV("Mute", False)])
+        assert s._transport_state == "PLAYING"  # untouched by unrelated vars
+
+
+class TestStopEventGuards:
+    """Fixing _on_event activated the previously-dead STOPPED branches
+    (auto-advance + queue-finished). A transient pre-playback STOPPED must not
+    skip track 1 / tear down the session, and duplicate STOPPED events must not
+    double-advance."""
+
+    def _ev(self, state):
+        return [_SV("TransportState", state)]
+
+    async def test_transient_stop_before_play_does_not_advance_or_cleanup(self):
+        s = QueueSession(_make_renderer(supports_next=False), _make_tracks(3))
+        s._dmr = MagicMock()
+        s._auto_advance = AsyncMock()
+        s._cleanup = AsyncMock()
+        s._on_event(MagicMock(), self._ev("STOPPED"))  # never reached PLAYING
+        await asyncio.sleep(0)
+        s._auto_advance.assert_not_awaited()
+        s._cleanup.assert_not_awaited()
+        assert s._advancing is False
+
+    async def test_stop_after_play_advances_once(self):
+        s = QueueSession(_make_renderer(supports_next=False), _make_tracks(3))
+        s._dmr = MagicMock()
+        s._auto_advance = AsyncMock()
+        s._on_event(MagicMock(), self._ev("PLAYING"))
+        s._on_event(MagicMock(), self._ev("STOPPED"))
+        assert s._advancing is True  # set before scheduling
+        await asyncio.sleep(0)
+        s._auto_advance.assert_awaited_once()
+
+    async def test_duplicate_stop_advances_only_once(self):
+        s = QueueSession(_make_renderer(supports_next=False), _make_tracks(3))
+        s._dmr = MagicMock()
+        s._auto_advance = AsyncMock()
+        s._on_event(MagicMock(), self._ev("PLAYING"))
+        s._on_event(MagicMock(), self._ev("STOPPED"))
+        s._on_event(MagicMock(), self._ev("STOPPED"))  # duplicate — guarded
+        await asyncio.sleep(0)
+        s._auto_advance.assert_awaited_once()
+
+    async def test_transient_stop_single_track_does_not_cleanup(self):
+        s = QueueSession(_make_renderer(), _make_tracks(1))
+        s._dmr = MagicMock()
+        s._cleanup = AsyncMock()
+        s._on_event(MagicMock(), self._ev("STOPPED"))  # never played
+        await asyncio.sleep(0)
+        s._cleanup.assert_not_awaited()
+
+    async def test_stop_after_play_last_track_cleans_up(self):
+        s = QueueSession(_make_renderer(), _make_tracks(1))
+        s._dmr = MagicMock()
+        s._cleanup = AsyncMock()
+        s._on_event(MagicMock(), self._ev("PLAYING"))
+        s._on_event(MagicMock(), self._ev("STOPPED"))
+        await asyncio.sleep(0)
+        s._cleanup.assert_awaited_once()
