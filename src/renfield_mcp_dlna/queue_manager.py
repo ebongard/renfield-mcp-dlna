@@ -116,6 +116,9 @@ class QueueSession:
         # Source of truth for status() — never assume "playing" just because a
         # renderer is bound.
         self._transport_state: str | None = None
+        # Guards the no-SetNext auto-advance against duplicate STOPPED events
+        # firing a second _auto_advance before the first incremented the index.
+        self._advancing = False
 
     def _build_metadata(self, track: Track) -> str:
         """Build DIDL-Lite metadata based on track media type."""
@@ -199,13 +202,20 @@ class QueueSession:
             await asyncio.wait_for(
                 self._dmr.async_update(), timeout=_TRANSPORT_POLL_TIMEOUT
             )
-            ts = self._dmr.transport_state
-        except Exception as e:  # noqa: BLE001 - poll is best-effort
-            logger.debug(f"[{self.renderer.name}] transport poll failed: {e}")
-            return None
+        except Exception as e:  # noqa: BLE001 - refresh is best-effort
+            # Fall through: the lib keeps transport_state fresh from the event
+            # subscription, so a failed/timed-out active refresh shouldn't blank
+            # an otherwise-known state.
+            logger.debug(f"[{self.renderer.name}] transport poll refresh failed: {e}")
+        ts = self._dmr.transport_state
         if ts is None:
             return None
-        return str(getattr(ts, "value", ts) or "").upper() or None
+        state = str(getattr(ts, "value", ts) or "").upper()
+        # The lib returns VENDOR_DEFINED when the state var exists but was never
+        # populated — that's "unknown", not a real transport state.
+        if not state or state == "VENDOR_DEFINED":
+            return None
+        return state
 
     async def refresh_state(self) -> None:
         """Best-effort refresh of the cached TransportState via an active poll.
@@ -218,12 +228,34 @@ class QueueSession:
             self._transport_state = polled
 
     def _on_event(self, service, state_variables) -> None:
-        """Handle AVTransport LAST_CHANGE events."""
+        """Handle AVTransport LAST_CHANGE events.
+
+        async_upnp_client delivers a **list** of changed UpnpStateVariable
+        objects (each with .name/.value), NOT a dict — calling .get() on it
+        raised AttributeError, which meant TransportState was never captured
+        (so status reported "unknown") and gapless-transition / auto-advance
+        detection silently never fired. Fold the list into a name->value map;
+        a dict is tolerated defensively for forward/backward compat.
+        """
         if not state_variables:
             return
 
-        transport_state = state_variables.get("TransportState")
-        current_uri = state_variables.get("CurrentTrackURI")
+        if isinstance(state_variables, dict):
+            changes = state_variables
+        else:
+            changes = {
+                getattr(sv, "name", None): getattr(sv, "value", None)
+                for sv in state_variables
+            }
+
+        transport_state = changes.get("TransportState")
+        current_uri = changes.get("CurrentTrackURI")
+
+        # Did the renderer actually reach a playing state for this track? A
+        # transient STOPPED/NO_MEDIA_PRESENT during the initial buffering window
+        # must NOT be mistaken for track-end (it would skip track 1 or tear down
+        # a single-track session before it ever played).
+        played = (self._transport_state or "").upper() in _TRANSPORT_OK
 
         if transport_state:
             self._transport_state = transport_state
@@ -247,41 +279,56 @@ class QueueSession:
                 return
 
         # Detect track end for renderers WITHOUT SetNext support:
-        # When transport stops and we have more tracks, auto-advance.
+        # When transport stops AFTER having played, and we have more tracks,
+        # auto-advance. _advancing dedupes duplicate STOPPED events that would
+        # otherwise fire a second advance and skip a track.
         if (
             transport_state == "STOPPED"
+            and played
             and not self.renderer.supports_next
             and self.current_index < len(self.tracks) - 1
+            and not self._advancing
         ):
             logger.info(
                 f"[{self.renderer.name}] Track ended (no gapless), advancing..."
             )
+            self._advancing = True
             asyncio.create_task(self._auto_advance())
             return
 
-        # Album finished
-        if transport_state == "STOPPED" and self.current_index >= len(self.tracks) - 1:
+        # Album finished — only after the last track actually played (guards
+        # against a transient pre-playback STOPPED tearing down the session).
+        if (
+            transport_state == "STOPPED"
+            and played
+            and self.current_index >= len(self.tracks) - 1
+        ):
             logger.info(f"[{self.renderer.name}] Queue finished")
             asyncio.create_task(self._cleanup())
 
     async def _auto_advance(self) -> None:
         """Advance to next track on renderers without SetNext (small gap)."""
-        if self.current_index + 1 >= len(self.tracks):
-            return
-        self.current_index += 1
-        self._preloaded_index = None
-        track = self.tracks[self.current_index]
-        metadata = self._build_metadata(track)
         try:
-            assert self._dmr is not None
-            await self._dmr.async_set_transport_uri(track.url, track.title, metadata)
-            await self._dmr.async_play()
-            logger.info(
-                f"[{self.renderer.name}] Auto-advanced to track "
-                f"{self.current_index + 1}/{len(self.tracks)}: {track.title}"
-            )
-        except Exception as e:
-            logger.error(f"[{self.renderer.name}] Auto-advance failed: {e}")
+            if self.current_index + 1 >= len(self.tracks):
+                return
+            self.current_index += 1
+            self._preloaded_index = None
+            track = self.tracks[self.current_index]
+            metadata = self._build_metadata(track)
+            try:
+                assert self._dmr is not None
+                await self._dmr.async_set_transport_uri(track.url, track.title, metadata)
+                await self._dmr.async_play()
+                logger.info(
+                    f"[{self.renderer.name}] Auto-advanced to track "
+                    f"{self.current_index + 1}/{len(self.tracks)}: {track.title}"
+                )
+            except Exception as e:
+                logger.error(f"[{self.renderer.name}] Auto-advance failed: {e}")
+        finally:
+            # Re-arm for the next track's STOPPED. The `played` gate prevents a
+            # premature re-advance until the new track actually reaches PLAYING.
+            self._advancing = False
 
     async def _preload_next(self) -> None:
         """Preload the next track via SetNextAVTransportURI."""
