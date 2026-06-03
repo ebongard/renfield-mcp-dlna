@@ -25,6 +25,15 @@ _factory: UpnpFactory | None = None
 # Session registry: renderer UDN → QueueSession
 _sessions: dict[str, "QueueSession"] = {}
 
+# UPnP AVTransport TransportState values (raw strings from LAST_CHANGE events).
+# A renderer that actually started playback reaches PLAYING; one that couldn't
+# fetch/decode the stream stays STOPPED / NO_MEDIA_PRESENT.
+_TRANSPORT_OK = {"PLAYING", "PAUSED_PLAYBACK"}
+_TRANSPORT_DEAD = {"STOPPED", "NO_MEDIA_PRESENT"}
+# How long start() waits for the renderer to confirm it began playing.
+_PLAYBACK_CONFIRM_TIMEOUT = 5.0
+_PLAYBACK_CONFIRM_INTERVAL = 0.5
+
 
 def _detect_local_ip() -> str:
     """Detect local IP that can reach the network (for UPnP callback URL)."""
@@ -97,6 +106,10 @@ class QueueSession:
         self.current_index = 0
         self._dmr: DmrDevice | None = None
         self._preloaded_index: int | None = None
+        # Last TransportState reported by the renderer via LAST_CHANGE events.
+        # Source of truth for status() — never assume "playing" just because a
+        # renderer is bound.
+        self._transport_state: str | None = None
 
     def _build_metadata(self, track: Track) -> str:
         """Build DIDL-Lite metadata based on track media type."""
@@ -123,11 +136,43 @@ class QueueSession:
         metadata = self._build_metadata(track)
         await self._dmr.async_set_transport_uri(track.url, track.title, metadata)
         await self._dmr.async_play()
+
+        # Verify the renderer actually started — a 404/unreachable stream leaves
+        # it STOPPED/NO_MEDIA_PRESENT. Surface that as a failure instead of
+        # logging "Playing" and letting status() falsely report success.
+        await self._confirm_playback_started(track.title)
+
         logger.info(f"[{self.renderer.name}] Playing track 1/{len(self.tracks)}: {track.title}")
 
         # Preload second track if renderer supports it
         if len(self.tracks) > 1 and self.renderer.supports_next:
             await self._preload_next()
+
+    async def _confirm_playback_started(self, title: str) -> None:
+        """Wait briefly for the renderer to confirm it began playback.
+
+        Raises RuntimeError if the renderer reports STOPPED/NO_MEDIA_PRESENT
+        (it accepted the command but couldn't play the stream — e.g. a 404
+        media URL). If no definitive state arrives within the timeout, log a
+        warning and continue rather than false-failing a renderer that simply
+        hasn't emitted an event yet.
+        """
+        waited = 0.0
+        while waited < _PLAYBACK_CONFIRM_TIMEOUT:
+            state = (self._transport_state or "").upper()
+            if state in _TRANSPORT_OK:
+                return
+            if state in _TRANSPORT_DEAD:
+                raise RuntimeError(
+                    f"renderer did not start playback (state={state}); "
+                    f"stream may be unreachable: {title}"
+                )
+            await asyncio.sleep(_PLAYBACK_CONFIRM_INTERVAL)
+            waited += _PLAYBACK_CONFIRM_INTERVAL
+        logger.warning(
+            f"[{self.renderer.name}] playback start unconfirmed for '{title}' "
+            f"(last state={self._transport_state})"
+        )
 
     def _on_event(self, service, state_variables) -> None:
         """Handle AVTransport LAST_CHANGE events."""
@@ -136,6 +181,9 @@ class QueueSession:
 
         transport_state = state_variables.get("TransportState")
         current_uri = state_variables.get("CurrentTrackURI")
+
+        if transport_state:
+            self._transport_state = transport_state
 
         logger.debug(
             f"[{self.renderer.name}] Event: state={transport_state}, uri={current_uri}"
@@ -290,12 +338,29 @@ class QueueSession:
         if not _sessions:
             await _shutdown_infrastructure()
 
+    def _playback_state(self) -> str:
+        """Map the renderer's last reported TransportState to a status string.
+
+        Reports what the renderer actually says — never "playing" merely
+        because a renderer is bound (the old behavior, which lied when the
+        stream failed).
+        """
+        if self._dmr is None:
+            return "stopped"
+        state = (self._transport_state or "").upper()
+        if state in _TRANSPORT_OK:
+            return "paused" if state == "PAUSED_PLAYBACK" else "playing"
+        if state in _TRANSPORT_DEAD:
+            return "stopped"
+        # Transitioning / not yet reported — say so, don't claim "playing".
+        return state.lower() if state else "unknown"
+
     def status(self) -> dict:
         """Return current playback status."""
         track = self.tracks[self.current_index] if self.tracks else None
         return {
             "renderer": self.renderer.name,
-            "state": "playing" if self._dmr else "stopped",
+            "state": self._playback_state(),
             "track": self.current_index + 1,
             "total_tracks": len(self.tracks),
             "title": track.title if track else None,
@@ -313,7 +378,17 @@ async def play_tracks(renderer: DlnaRenderer, tracks: list[Track]) -> QueueSessi
 
     session = QueueSession(renderer, tracks)
     _sessions[renderer.udn] = session
-    await session.start()
+    try:
+        await session.start()
+    except Exception:
+        # start() failed (e.g. the renderer never began playback) — don't leave
+        # a dead session registered claiming a renderer.
+        _sessions.pop(renderer.udn, None)
+        try:
+            await session.stop()
+        except Exception:
+            pass
+        raise
     return session
 
 
