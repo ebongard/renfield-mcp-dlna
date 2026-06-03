@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import socket
+import time
 from dataclasses import dataclass, field
 
 from async_upnp_client.aiohttp import AiohttpNotifyServer, AiohttpRequester
@@ -33,6 +34,11 @@ _TRANSPORT_DEAD = {"STOPPED", "NO_MEDIA_PRESENT"}
 # How long start() waits for the renderer to confirm it began playing.
 _PLAYBACK_CONFIRM_TIMEOUT = 5.0
 _PLAYBACK_CONFIRM_INTERVAL = 0.5
+# Hard wall-clock budget for a single GetTransportInfo poll. async_update()
+# issues several sequential SOAP calls (and a larger burst on the first poll),
+# each with the library's default 5s timeout — without a budget a hung renderer
+# could block get_status for tens of seconds.
+_TRANSPORT_POLL_TIMEOUT = 3.0
 
 
 def _detect_local_ip() -> str:
@@ -157,9 +163,16 @@ class QueueSession:
         warning and continue rather than false-failing a renderer that simply
         hasn't emitted an event yet.
         """
-        waited = 0.0
-        while waited < _PLAYBACK_CONFIRM_TIMEOUT:
+        # Wall-clock deadline: the poll fallback below can itself take seconds,
+        # so summing the sleep interval would badly undercount elapsed time.
+        deadline = time.monotonic() + _PLAYBACK_CONFIRM_TIMEOUT
+        while time.monotonic() < deadline:
             state = (self._transport_state or "").upper()
+            # Renderers that don't emit LAST_CHANGE events (e.g. HiFiBerryOS)
+            # never populate _transport_state — actively poll GetTransportInfo
+            # so we can still confirm (or rule out) playback.
+            if not state:
+                state = (await self._query_transport_state()) or ""
             if state in _TRANSPORT_OK:
                 return
             if state in _TRANSPORT_DEAD:
@@ -168,11 +181,41 @@ class QueueSession:
                     f"stream may be unreachable: {title}"
                 )
             await asyncio.sleep(_PLAYBACK_CONFIRM_INTERVAL)
-            waited += _PLAYBACK_CONFIRM_INTERVAL
         logger.warning(
             f"[{self.renderer.name}] playback start unconfirmed for '{title}' "
             f"(last state={self._transport_state})"
         )
+
+    async def _query_transport_state(self) -> str | None:
+        """Actively poll the renderer for its current TransportState.
+
+        Fallback for renderers that don't emit LAST_CHANGE events: calls
+        GetTransportInfo via async_update() and returns the raw UPnP state
+        string (e.g. "PLAYING"), or None if the poll fails / yields nothing.
+        """
+        if self._dmr is None:
+            return None
+        try:
+            await asyncio.wait_for(
+                self._dmr.async_update(), timeout=_TRANSPORT_POLL_TIMEOUT
+            )
+            ts = self._dmr.transport_state
+        except Exception as e:  # noqa: BLE001 - poll is best-effort
+            logger.debug(f"[{self.renderer.name}] transport poll failed: {e}")
+            return None
+        if ts is None:
+            return None
+        return str(getattr(ts, "value", ts) or "").upper() or None
+
+    async def refresh_state(self) -> None:
+        """Best-effort refresh of the cached TransportState via an active poll.
+
+        Called by get_status so status() reports the renderer's true state even
+        on event-silent renderers. Leaves the last known state untouched if the
+        poll fails."""
+        polled = await self._query_transport_state()
+        if polled:
+            self._transport_state = polled
 
     def _on_event(self, service, state_variables) -> None:
         """Handle AVTransport LAST_CHANGE events."""
