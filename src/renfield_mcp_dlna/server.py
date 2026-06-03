@@ -226,6 +226,9 @@ async def get_status(renderer_name: str) -> dict:
             "message": "No active playback",
         }
 
+    # Actively poll the renderer (GetTransportInfo) so the reported state is
+    # accurate even for renderers that don't emit LAST_CHANGE events.
+    await session.refresh_state()
     return session.status()
 
 

@@ -1,5 +1,6 @@
 """Tests for renfield-mcp-dlna MCP server."""
 
+import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -351,7 +352,7 @@ class TestSetVolume:
 # QueueSession Unit Tests
 # ---------------------------------------------------------------------------
 
-class TestQueueSessionStatus:
+class TestQueueSessionStatusFields:
     def test_status_returns_correct_info(self):
         renderer = _make_renderer()
         tracks = _make_tracks(5)
@@ -535,3 +536,90 @@ class TestConfirmPlaybackStarted:
         s = QueueSession(_make_renderer(), _make_tracks(1))
         s._transport_state = None
         await s._confirm_playback_started("Track 1")  # warns, no raise
+
+    async def test_confirms_via_poll_when_no_event(self):
+        # Event-silent renderer (HiFiBerryOS): no LAST_CHANGE event ever fires,
+        # but an active GetTransportInfo poll reports PLAYING → confirmed.
+        s = QueueSession(_make_renderer(), _make_tracks(1))
+        s._transport_state = None
+        s._query_transport_state = AsyncMock(return_value="PLAYING")
+        await s._confirm_playback_started("Track 1")  # no raise
+        s._query_transport_state.assert_awaited()
+
+    async def test_poll_detects_dead_renderer(self):
+        # Poll reveals the renderer never started (404 stream → STOPPED).
+        s = QueueSession(_make_renderer(), _make_tracks(1))
+        s._transport_state = None
+        s._query_transport_state = AsyncMock(return_value="STOPPED")
+        with pytest.raises(RuntimeError, match="did not start playback"):
+            await s._confirm_playback_started("Track 1")
+
+
+class TestQueryTransportState:
+    """_query_transport_state actively polls GetTransportInfo; refresh_state
+    feeds that into the cached state so status() is accurate on event-silent
+    renderers."""
+
+    async def test_query_returns_normalized_state(self):
+        s = QueueSession(_make_renderer(), _make_tracks(1))
+        dmr = MagicMock()
+        dmr.async_update = AsyncMock()
+        dmr.transport_state = MagicMock(value="PLAYING")
+        s._dmr = dmr
+        assert await s._query_transport_state() == "PLAYING"
+        dmr.async_update.assert_awaited()
+
+    async def test_query_normalizes_real_transport_state_enum(self):
+        # The real DmrDevice yields a TransportState(str, Enum) member whose
+        # str() is "TransportState.PLAYING" — only .value gives "PLAYING".
+        # This guards against a regression to str(ts).upper().
+        from async_upnp_client.profiles.dlna import TransportState
+
+        s = QueueSession(_make_renderer(), _make_tracks(1))
+        dmr = MagicMock()
+        dmr.async_update = AsyncMock()
+        dmr.transport_state = TransportState.PLAYING
+        s._dmr = dmr
+        assert await s._query_transport_state() == "PLAYING"
+
+    async def test_query_bounded_by_timeout(self, monkeypatch):
+        # A hung renderer must not block get_status: async_update is wrapped in
+        # asyncio.wait_for, so an overrunning poll returns None within budget.
+        monkeypatch.setattr(queue_manager, "_TRANSPORT_POLL_TIMEOUT", 0.01)
+
+        async def _hang():
+            await asyncio.sleep(1.0)
+
+        s = QueueSession(_make_renderer(), _make_tracks(1))
+        dmr = MagicMock()
+        dmr.async_update = _hang
+        s._dmr = dmr
+        assert await s._query_transport_state() is None
+
+    async def test_query_returns_none_when_unbound(self):
+        s = QueueSession(_make_renderer(), _make_tracks(1))
+        assert s._dmr is None
+        assert await s._query_transport_state() is None
+
+    async def test_query_swallows_poll_error(self):
+        s = QueueSession(_make_renderer(), _make_tracks(1))
+        dmr = MagicMock()
+        dmr.async_update = AsyncMock(side_effect=RuntimeError("upnp timeout"))
+        s._dmr = dmr
+        assert await s._query_transport_state() is None
+
+    async def test_refresh_state_updates_status(self):
+        s = QueueSession(_make_renderer(), _make_tracks(1))
+        s._dmr = MagicMock()
+        s._query_transport_state = AsyncMock(return_value="PLAYING")
+        await s.refresh_state()
+        assert s._transport_state == "PLAYING"
+        assert s.status()["state"] == "playing"
+
+    async def test_refresh_state_keeps_last_known_on_failed_poll(self):
+        s = QueueSession(_make_renderer(), _make_tracks(1))
+        s._dmr = MagicMock()
+        s._transport_state = "PLAYING"
+        s._query_transport_state = AsyncMock(return_value=None)
+        await s.refresh_state()
+        assert s._transport_state == "PLAYING"  # untouched
