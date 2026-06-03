@@ -160,12 +160,14 @@ class TestPlayTracks:
     async def test_renderer_not_found(self):
         with patch.object(discovery, "find_renderer", new_callable=AsyncMock, return_value=None):
             result = await server.play_tracks("Nonexistent", "[]")
+            assert result["success"] is False
             assert "error" in result
 
     async def test_invalid_json(self):
         renderer = _make_renderer()
         with patch.object(discovery, "find_renderer", new_callable=AsyncMock, return_value=renderer):
             result = await server.play_tracks("HiFiBerry", "not json")
+            assert result["success"] is False
             assert "error" in result
             assert "Invalid tracks JSON" in result["error"]
 
@@ -173,6 +175,7 @@ class TestPlayTracks:
         renderer = _make_renderer()
         with patch.object(discovery, "find_renderer", new_callable=AsyncMock, return_value=renderer):
             result = await server.play_tracks("HiFiBerry", "[]")
+            assert result["success"] is False
             assert "error" in result
             assert "non-empty" in result["error"]
 
@@ -180,6 +183,7 @@ class TestPlayTracks:
         renderer = _make_renderer()
         with patch.object(discovery, "find_renderer", new_callable=AsyncMock, return_value=renderer):
             result = await server.play_tracks("HiFiBerry", '[{"title": "No URL"}]')
+            assert result["success"] is False
             assert "error" in result
             assert "url" in result["error"]
 
@@ -205,6 +209,7 @@ class TestStop:
     async def test_renderer_not_found(self):
         with patch.object(discovery, "find_renderer", new_callable=AsyncMock, return_value=None):
             result = await server.stop("Nonexistent")
+            assert result["success"] is False
             assert "error" in result
 
     async def test_no_active_session(self):
@@ -214,6 +219,7 @@ class TestStop:
             patch.object(queue_manager, "get_session", return_value=None),
         ):
             result = await server.stop("HiFiBerry")
+            assert result["success"] is False
             assert "error" in result
             assert "No active playback" in result["error"]
 
@@ -255,6 +261,7 @@ class TestNextTrack:
             patch.object(queue_manager, "get_session", return_value=mock_session),
         ):
             result = await server.next_track("HiFiBerry")
+            assert result["success"] is False
             assert "error" in result
             assert "last track" in result["error"]
 
@@ -283,6 +290,7 @@ class TestPreviousTrack:
             patch.object(queue_manager, "get_session", return_value=mock_session),
         ):
             result = await server.previous_track("HiFiBerry")
+            assert result["success"] is False
             assert "error" in result
             assert "first track" in result["error"]
 

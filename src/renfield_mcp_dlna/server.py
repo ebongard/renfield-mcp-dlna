@@ -62,20 +62,20 @@ async def play_tracks(
     """
     renderer = await discovery.find_renderer(renderer_name)
     if not renderer:
-        return {"error": f"Renderer '{renderer_name}' not found"}
+        return {"success": False, "error": f"Renderer '{renderer_name}' not found"}
 
     try:
         track_list_raw = json.loads(tracks)
     except (json.JSONDecodeError, TypeError) as e:
-        return {"error": f"Invalid tracks JSON: {e}"}
+        return {"success": False, "error": f"Invalid tracks JSON: {e}"}
 
     if not isinstance(track_list_raw, list) or not track_list_raw:
-        return {"error": "tracks must be a non-empty JSON array"}
+        return {"success": False, "error": "tracks must be a non-empty JSON array"}
 
     track_objects = []
     for i, t in enumerate(track_list_raw):
         if not isinstance(t, dict) or not t.get("url"):
-            return {"error": f"Track {i} missing required 'url' field"}
+            return {"success": False, "error": f"Track {i} missing required 'url' field"}
         track_objects.append(
             Track(
                 url=t["url"],
@@ -103,7 +103,7 @@ async def play_tracks(
         }
     except Exception as e:
         logger.error(f"play_tracks failed on {renderer.name}: {e}", exc_info=True)
-        return {"error": f"Playback failed: {e}"}
+        return {"success": False, "error": f"Playback failed: {e}"}
 
 
 @mcp.tool()
@@ -111,11 +111,11 @@ async def stop(renderer_name: str) -> dict:
     """Stop playback and clear queue on a DLNA renderer."""
     renderer = await discovery.find_renderer(renderer_name)
     if not renderer:
-        return {"error": f"Renderer '{renderer_name}' not found"}
+        return {"success": False, "error": f"Renderer '{renderer_name}' not found"}
 
     session = queue_manager.get_session(renderer.udn)
     if not session:
-        return {"error": f"No active playback on '{renderer.name}'"}
+        return {"success": False, "error": f"No active playback on '{renderer.name}'"}
 
     await session.stop()
     return {"success": True, "renderer": renderer.name, "action": "stopped"}
@@ -126,17 +126,17 @@ async def pause(renderer_name: str) -> dict:
     """Pause playback on a DLNA renderer."""
     renderer = await discovery.find_renderer(renderer_name)
     if not renderer:
-        return {"error": f"Renderer '{renderer_name}' not found"}
+        return {"success": False, "error": f"Renderer '{renderer_name}' not found"}
 
     session = queue_manager.get_session(renderer.udn)
     if not session:
-        return {"error": f"No active playback on '{renderer.name}'"}
+        return {"success": False, "error": f"No active playback on '{renderer.name}'"}
 
     try:
         await session.pause()
         return {"success": True, "renderer": renderer.name, "action": "paused"}
     except Exception as e:
-        return {"error": f"Pause failed: {e}"}
+        return {"success": False, "error": f"Pause failed: {e}"}
 
 
 @mcp.tool()
@@ -144,17 +144,17 @@ async def resume(renderer_name: str) -> dict:
     """Resume playback on a DLNA renderer."""
     renderer = await discovery.find_renderer(renderer_name)
     if not renderer:
-        return {"error": f"Renderer '{renderer_name}' not found"}
+        return {"success": False, "error": f"Renderer '{renderer_name}' not found"}
 
     session = queue_manager.get_session(renderer.udn)
     if not session:
-        return {"error": f"No active playback on '{renderer.name}'"}
+        return {"success": False, "error": f"No active playback on '{renderer.name}'"}
 
     try:
         await session.resume()
         return {"success": True, "renderer": renderer.name, "action": "resumed"}
     except Exception as e:
-        return {"error": f"Resume failed: {e}"}
+        return {"success": False, "error": f"Resume failed: {e}"}
 
 
 @mcp.tool()
@@ -162,15 +162,15 @@ async def next_track(renderer_name: str) -> dict:
     """Skip to the next track in the queue."""
     renderer = await discovery.find_renderer(renderer_name)
     if not renderer:
-        return {"error": f"Renderer '{renderer_name}' not found"}
+        return {"success": False, "error": f"Renderer '{renderer_name}' not found"}
 
     session = queue_manager.get_session(renderer.udn)
     if not session:
-        return {"error": f"No active playback on '{renderer.name}'"}
+        return {"success": False, "error": f"No active playback on '{renderer.name}'"}
 
     track = await session.next()
     if track is None:
-        return {"error": "Already at last track"}
+        return {"success": False, "error": "Already at last track"}
 
     return {
         "success": True,
@@ -189,15 +189,15 @@ async def previous_track(renderer_name: str) -> dict:
     """Go to the previous track in the queue."""
     renderer = await discovery.find_renderer(renderer_name)
     if not renderer:
-        return {"error": f"Renderer '{renderer_name}' not found"}
+        return {"success": False, "error": f"Renderer '{renderer_name}' not found"}
 
     session = queue_manager.get_session(renderer.udn)
     if not session:
-        return {"error": f"No active playback on '{renderer.name}'"}
+        return {"success": False, "error": f"No active playback on '{renderer.name}'"}
 
     track = await session.previous()
     if track is None:
-        return {"error": "Already at first track"}
+        return {"success": False, "error": "Already at first track"}
 
     return {
         "success": True,
@@ -216,7 +216,7 @@ async def get_status(renderer_name: str) -> dict:
     """Get current playback status, track info, and queue position."""
     renderer = await discovery.find_renderer(renderer_name)
     if not renderer:
-        return {"error": f"Renderer '{renderer_name}' not found"}
+        return {"success": False, "error": f"Renderer '{renderer_name}' not found"}
 
     session = queue_manager.get_session(renderer.udn)
     if not session:
@@ -237,18 +237,18 @@ async def set_volume(renderer_name: str, volume: int) -> dict:
     """Set playback volume (0-100) on a DLNA renderer."""
     renderer = await discovery.find_renderer(renderer_name)
     if not renderer:
-        return {"error": f"Renderer '{renderer_name}' not found"}
+        return {"success": False, "error": f"Renderer '{renderer_name}' not found"}
 
     session = queue_manager.get_session(renderer.udn)
     if not session:
-        return {"error": f"No active playback on '{renderer.name}'"}
+        return {"success": False, "error": f"No active playback on '{renderer.name}'"}
 
     volume = max(0, min(100, volume))
     try:
         await session.set_volume(volume)
         return {"success": True, "renderer": renderer.name, "volume": volume}
     except Exception as e:
-        return {"error": f"Failed to set volume: {e}"}
+        return {"success": False, "error": f"Failed to set volume: {e}"}
 
 
 def main():
