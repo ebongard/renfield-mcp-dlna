@@ -474,3 +474,64 @@ class TestPlayTracksVideo:
             assert result.get("success") is True
             tracks_passed = mock_play.call_args.args[1]
             assert tracks_passed[0].media_type == "audio"
+
+
+# ---------------------------------------------------------------------------
+# QueueSession status honesty + playback-start confirmation (issue #3)
+# ---------------------------------------------------------------------------
+
+class TestQueueSessionStatus:
+    """status() must reflect the renderer's real TransportState, never assume
+    'playing' just because a renderer is bound (the bug that hid silent
+    playback when the stream 404'd)."""
+
+    def _bound(self, transport_state):
+        s = QueueSession(_make_renderer(), _make_tracks(1))
+        s._dmr = MagicMock()  # bound to a renderer
+        s._transport_state = transport_state
+        return s
+
+    def test_stopped_when_unbound(self):
+        s = QueueSession(_make_renderer(), _make_tracks(1))
+        assert s._dmr is None
+        assert s.status()["state"] == "stopped"
+
+    def test_bound_without_event_is_not_playing(self):
+        # The regression: bound → always "playing". Now: no event yet → unknown.
+        assert self._bound(None).status()["state"] == "unknown"
+
+    def test_reports_real_transport_state(self):
+        assert self._bound("PLAYING").status()["state"] == "playing"
+        assert self._bound("PAUSED_PLAYBACK").status()["state"] == "paused"
+        assert self._bound("STOPPED").status()["state"] == "stopped"
+        assert self._bound("NO_MEDIA_PRESENT").status()["state"] == "stopped"
+        assert self._bound("TRANSITIONING").status()["state"] == "transitioning"
+
+
+class TestConfirmPlaybackStarted:
+    """start() must surface a renderer that accepted the command but never
+    actually played (e.g. a 404 stream → STOPPED/NO_MEDIA_PRESENT)."""
+
+    async def test_returns_when_playing(self):
+        s = QueueSession(_make_renderer(), _make_tracks(1))
+        s._transport_state = "PLAYING"
+        await s._confirm_playback_started("Track 1")  # no raise
+
+    async def test_raises_when_stream_unreachable(self):
+        s = QueueSession(_make_renderer(), _make_tracks(1))
+        s._transport_state = "NO_MEDIA_PRESENT"
+        with pytest.raises(RuntimeError, match="did not start playback"):
+            await s._confirm_playback_started("Track 1")
+
+    async def test_raises_on_stopped(self):
+        s = QueueSession(_make_renderer(), _make_tracks(1))
+        s._transport_state = "STOPPED"
+        with pytest.raises(RuntimeError, match="did not start playback"):
+            await s._confirm_playback_started("Track 1")
+
+    async def test_no_false_fail_when_no_event(self, monkeypatch):
+        # A renderer that simply hasn't emitted an event yet must not be failed.
+        monkeypatch.setattr(queue_manager, "_PLAYBACK_CONFIRM_TIMEOUT", 0.0)
+        s = QueueSession(_make_renderer(), _make_tracks(1))
+        s._transport_state = None
+        await s._confirm_playback_started("Track 1")  # warns, no raise
