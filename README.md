@@ -1,8 +1,12 @@
 # renfield-mcp-dlna
 
-MCP server for DLNA media renderer control with gapless queue playback. Discovers DLNA renderers via SSDP and controls them directly using UPnP AVTransport — no intermediate media server needed for playback control.
+MCP server that acts as a UPnP/DLNA **control point**: discovers renderers **and**
+MediaServers via SSDP, plays to renderers with gapless queues, and browses content
+libraries. Per-device-class backends cover standard DLNA AVTransport, OpenHome
+(Linn, native device-side queue), and Sonos (via `soco`).
 
-Uses Jellyfin's built-in DLNA server for media serving (content URLs point to Jellyfin).
+Content can come from any MediaServer's ContentDirectory (e.g. Jellyfin's built-in
+DLNA server) via `play_from_server`, or from caller-supplied URLs via `play_tracks`.
 
 ## Tools
 
@@ -65,9 +69,27 @@ The server listens on `http://0.0.0.0:9091/mcp` (configurable via `MCP_HOST` and
 | `RENFIELD_OPENHOME` | on | OpenHome renderers (Linn) use the native Playlist backend by default (hardware-validated); set `0` to fall back to AVTransport |
 | `RENFIELD_SONOS` | unset | `1` routes Sonos renderers to the `soco`-backed backend (provisional; needs `.[sonos]`) |
 
-## Deployment as Host Service
+## Deployment
 
-SSDP multicast (`239.255.255.250:1900`) requires LAN access. When Renfield runs in Docker, this server must run **on the host** (not in a container) so it can discover DLNA renderers.
+SSDP multicast (`239.255.255.250:1900`) requires **LAN access**, so this server
+must share the host's network — either run it directly on the host, or in a
+container with **host networking** (`docker run --network host` / Kubernetes
+`hostNetwork: true`). A container on a bridge/NAT network can't see SSDP and won't
+discover renderers. (Running on the long-lived `streamable-http` transport also
+enables the passive SSDP live cache + session watchdog.)
+
+### Docker
+
+A dedicated image is built from the included `Dockerfile` (defaults to
+`streamable-http` on `0.0.0.0:9091`):
+
+```bash
+docker build -t renfield-mcp-dlna .
+docker run --rm --network host renfield-mcp-dlna
+```
+
+For Sonos support, build with the extra: add `RUN pip install '.[sonos]'` or set
+`RENFIELD_SONOS=1` against an image that includes `soco`.
 
 ### systemd Service
 
@@ -134,3 +156,6 @@ DLNA Renderers (LAN)          DLNA MCP Server (Host)         Renfield Backend (D
 - `python-didl-lite>=1.4.0` — DIDL-Lite XML for UPnP metadata
 - `aiohttp>=3.9.0` — Async HTTP for device description fetching
 - `defusedxml>=0.7` — hardened XML parsing of (LAN-spoofable) device descriptions
+- `ifaddr>=0.2` — local-interface enumeration for multi-interface SSDP discovery
+
+Optional: `pip install '.[sonos]'` adds `soco>=0.30` for the (provisional) Sonos backend.
