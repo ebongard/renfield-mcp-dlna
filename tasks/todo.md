@@ -9,6 +9,29 @@ Confirmed scope: renderers + MediaServers; device classes OpenHome (Linn), DLNA 
 (Samsung/LG/Sony), standard AVTransport (HiFiBerry/Kodi/VLC), Sonos; IPv4 multi-interface
 live-cache discovery.
 
+## Progress (branch `feat/upnp-control-point-phase1`, 129 tests green)
+
+Landed and verified with the mock suite (real-device validation still pending where noted):
+
+- ✅ **T5** `resolve_session`/`resolve_renderer` helpers + `_error()` — tool guards de-duplicated.
+- ✅ **T3** `PlaybackBackend` ABC + `AvTransportBackend` extracted from `QueueSession`; device
+  I/O (DmrDevice, RC volume/mute, polling, raw event parse) now lives in the backend.
+- ✅ **Code review** of the diff: found + fixed a real played-gate regression (sticky flag →
+  faithful `_prev_transport_state`) and an ABC signature lie. Regression test added.
+- ✅ **T2** `ControlPoint` replaces module-global infra; lazy-init race closed with a lock.
+- ✅ Discovery identity capture (`manufacturer`/`model_name`) + `is_openhome` detection; backend
+  factory seam wired.
+- ✅ **T6 (partial)** P2 read+write surface: enriched `get_status`
+  (position/duration/capabilities/volume/muted/valid_play_modes), new `get_mute`, `seek`,
+  `set_play_mode` tools. *Design change:* one `set_play_mode` instead of separate
+  set_repeat/set_shuffle — UPnP exposes a single CurrentPlayMode enum, so independent toggles
+  would clobber each other.
+- ✅ CLAUDE.md architecture section updated for the new layout.
+
+**Pending (needs a real LAN / hardware to verify — not shipping blind):** T1 full SSDP-listener
+discovery rewrite, T4 OpenHome spike, T8 TV protocolInfo validation, T7 metadata hot-path,
+T9 MediaServer, T10 OpenHomeBackend, T11 Sonos, T12 session hardening, T13 real-device harness.
+
 ## Decisions (from review)
 
 | # | Decision |
