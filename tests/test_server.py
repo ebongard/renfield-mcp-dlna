@@ -1668,3 +1668,45 @@ class TestServerDescriptionParsing:
         xml = _DESC_TMPL.format(name="Speaker", mfr="HiFiBerry", model="OS", extra_service="")
         r = await discovery._fetch_server_description(_desc_session(xml), "http://1.2.3.4:9999/d.xml")
         assert r is None
+
+
+# ---------------------------------------------------------------------------
+# Per-UDN lock (serialises concurrent play swaps on one renderer)
+# ---------------------------------------------------------------------------
+
+class TestPerUdnLock:
+    def test_lock_for_is_stable_per_udn(self):
+        cp = ControlPoint()
+        a1 = cp.lock_for("uuid:a")
+        a2 = cp.lock_for("uuid:a")
+        b = cp.lock_for("uuid:b")
+        assert a1 is a2  # same UDN → same lock
+        assert a1 is not b  # different UDN → different lock
+
+    async def test_concurrent_play_tracks_serialised(self, monkeypatch):
+        # Two concurrent play_tracks on the SAME renderer must not interleave the
+        # stop-old/start-new swap; exactly one session remains, started twice in
+        # series (the 2nd stops the 1st).
+        cp = ControlPoint()
+        renderer = _make_renderer()
+        order = []
+
+        async def _fake_start(self):
+            order.append(("start", id(self)))
+            await asyncio.sleep(0)  # yield: lets the other task try to interleave
+
+        async def _fake_stop(self):
+            order.append(("stop", id(self)))
+            await self.control_point.unregister(self.renderer.udn)
+
+        monkeypatch.setattr(QueueSession, "start", _fake_start)
+        monkeypatch.setattr(QueueSession, "stop", _fake_stop)
+
+        await asyncio.gather(
+            queue_manager.play_tracks(renderer, _make_tracks(1), control_point=cp),
+            queue_manager.play_tracks(renderer, _make_tracks(1), control_point=cp),
+        )
+        # One session left registered; the swap ran without interleaving (the
+        # second play stopped the first before starting its own).
+        assert len(cp.get_all_sessions()) == 1
+        assert order.count(("start", order[0][1])) == 1  # first start not duplicated

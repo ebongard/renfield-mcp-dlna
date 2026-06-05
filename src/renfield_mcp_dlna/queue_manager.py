@@ -400,25 +400,28 @@ async def play_tracks(
     """Create and start a new queue session, replacing any existing one."""
     cp = control_point or _default_control_point
 
-    # Stop existing session on this renderer
-    existing = cp.get_session(renderer.udn)
-    if existing:
-        await existing.stop()
+    # Serialise the stop-old/start-new swap so two concurrent play requests on
+    # the same renderer can't both register a session / race the infra. The lock
+    # is acquired only here (start()/stop() don't take it), so no reentrancy.
+    async with cp.lock_for(renderer.udn):
+        existing = cp.get_session(renderer.udn)
+        if existing:
+            await existing.stop()
 
-    session = QueueSession(renderer, tracks, control_point=cp)
-    cp.register(renderer.udn, session)
-    try:
-        await session.start()
-    except Exception:
-        # start() failed (e.g. the renderer never began playback) — don't leave
-        # a dead session registered claiming a renderer.
-        cp.sessions.pop(renderer.udn, None)
+        session = QueueSession(renderer, tracks, control_point=cp)
+        cp.register(renderer.udn, session)
         try:
-            await session.stop()
+            await session.start()
         except Exception:
-            pass
-        raise
-    return session
+            # start() failed (e.g. the renderer never began playback) — don't
+            # leave a dead session registered claiming a renderer.
+            cp.sessions.pop(renderer.udn, None)
+            try:
+                await session.stop()
+            except Exception:
+                pass
+            raise
+        return session
 
 
 def get_session(udn: str) -> QueueSession | None:

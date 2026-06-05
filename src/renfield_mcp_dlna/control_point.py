@@ -61,6 +61,9 @@ class ControlPoint:
         # Serialises lazy infra startup so two concurrent first-plays don't both
         # build and bind a notify server.
         self._infra_lock = asyncio.Lock()
+        # Per-renderer locks so two concurrent play requests on one renderer
+        # don't race the stop-old/start-new session swap.
+        self._udn_locks: dict[str, asyncio.Lock] = {}
 
     @property
     def started(self) -> bool:
@@ -98,6 +101,15 @@ class ControlPoint:
         self._requester = None
         self.event_handler = None
         self.factory = None
+
+    def lock_for(self, udn: str) -> asyncio.Lock:
+        """A stable per-renderer lock (created on first use). Held around the
+        session-swap critical section in play_tracks."""
+        lock = self._udn_locks.get(udn)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._udn_locks[udn] = lock
+        return lock
 
     # -- session registry --------------------------------------------------
 
