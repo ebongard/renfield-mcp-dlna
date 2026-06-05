@@ -1145,14 +1145,7 @@ class TestDeviceIdentity:
         assert r.manufacturer == "Linn"
 
 
-class TestBackendFactoryOpenHome:
-    def test_openhome_renderer_still_gets_avtransport_for_now(self):
-        # Seam is wired (is_openhome detected) but OpenHomeBackend is Phase 5;
-        # until then OpenHome renderers use the AVTransport they also advertise.
-        renderer = _make_renderer()
-        renderer.is_openhome = True
-        backend = queue_manager._make_backend(renderer)
-        assert isinstance(backend, AvTransportBackend)
+# (OpenHome factory routing is covered by TestOpenHomeFactoryRouting below.)
 
 
 # ---------------------------------------------------------------------------
