@@ -401,6 +401,64 @@ class TestGetVolume:
             assert "not found" in result["error"]
 
 
+class TestSetMute:
+    async def test_mute(self):
+        renderer = _make_renderer()
+        mock_session = MagicMock(spec=QueueSession)
+        mock_session.set_mute = AsyncMock()
+        with (
+            patch.object(discovery, "find_renderer", new_callable=AsyncMock, return_value=renderer),
+            patch.object(queue_manager, "get_session", return_value=mock_session),
+        ):
+            result = await server.set_mute("HiFiBerry", True)
+            assert result.get("success") is True
+            assert result["muted"] is True
+            mock_session.set_mute.assert_awaited_once_with(True)
+
+    async def test_unmute(self):
+        renderer = _make_renderer()
+        mock_session = MagicMock(spec=QueueSession)
+        mock_session.set_mute = AsyncMock()
+        with (
+            patch.object(discovery, "find_renderer", new_callable=AsyncMock, return_value=renderer),
+            patch.object(queue_manager, "get_session", return_value=mock_session),
+        ):
+            result = await server.set_mute("HiFiBerry", False)
+            assert result.get("success") is True
+            assert result["muted"] is False
+            mock_session.set_mute.assert_awaited_once_with(False)
+
+    async def test_no_active_session(self):
+        renderer = _make_renderer()
+        with (
+            patch.object(discovery, "find_renderer", new_callable=AsyncMock, return_value=renderer),
+            patch.object(queue_manager, "get_session", return_value=None),
+        ):
+            result = await server.set_mute("HiFiBerry", True)
+            assert result.get("success") is False
+            assert "No active playback" in result["error"]
+
+    async def test_renderer_not_found(self):
+        with patch.object(
+            discovery, "find_renderer", new_callable=AsyncMock, return_value=None
+        ):
+            result = await server.set_mute("Unknown", True)
+            assert result.get("success") is False
+            assert "not found" in result["error"]
+
+    async def test_set_mute_failure(self):
+        renderer = _make_renderer()
+        mock_session = MagicMock(spec=QueueSession)
+        mock_session.set_mute = AsyncMock(side_effect=RuntimeError("upnp error"))
+        with (
+            patch.object(discovery, "find_renderer", new_callable=AsyncMock, return_value=renderer),
+            patch.object(queue_manager, "get_session", return_value=mock_session),
+        ):
+            result = await server.set_mute("HiFiBerry", True)
+            assert result.get("success") is False
+            assert "Failed to set mute" in result["error"]
+
+
 # ---------------------------------------------------------------------------
 # QueueSession Unit Tests
 # ---------------------------------------------------------------------------
@@ -758,6 +816,23 @@ class TestVolumeCache:
         await s.set_volume(55)
         assert s._volume == 55
         s._dmr.async_set_volume_level.assert_awaited_once_with(0.55)
+
+    async def test_set_mute_calls_dmr_when_supported(self):
+        s = QueueSession(_make_renderer(), _make_tracks(1))
+        s._dmr = MagicMock()
+        s._dmr.has_volume_mute = True
+        s._dmr.async_mute_volume = AsyncMock()
+        await s.set_mute(True)
+        s._dmr.async_mute_volume.assert_awaited_once_with(True)
+
+    async def test_set_mute_clear_error_when_unsupported(self):
+        s = QueueSession(_make_renderer(), _make_tracks(1))
+        s._dmr = MagicMock()
+        s._dmr.has_volume_mute = False
+        s._dmr.async_mute_volume = AsyncMock()
+        with pytest.raises(RuntimeError, match="does not support mute"):
+            await s.set_mute(True)
+        s._dmr.async_mute_volume.assert_not_awaited()
 
     async def test_get_volume_returns_cache_without_polling(self):
         s = QueueSession(_make_renderer(), _make_tracks(1))
