@@ -56,10 +56,12 @@ Source modules under `src/renfield_mcp_dlna/`, layered:
   `DmrDevice`, RenderingControl volume/mute, polling, raw `LAST_CHANGE` parsing).
   `OpenHomeBackend` and `SonosBackend` are **`owns_queue=True`** (device holds the
   queue): they implement `load_queue`/`go_next`/`go_previous` and QueueSession
-  hands the whole queue over once. Both are **PROVISIONAL** (mock+spec only, no
-  real device yet) and env-gated: `RENFIELD_OPENHOME=1` / `RENFIELD_SONOS=1`
-  (else OpenHome/Sonos renderers use AVTransport). `soco` is an optional dep
-  (`pip install '.[sonos]'`).
+  hands the whole queue over once. `OpenHomeBackend` is **hardware-validated**
+  (Linn — discovery via the sibling `Source` device, `Volume:4`, playback to real
+  `TransportState=PLAYING`) and is the **default** for OpenHome renderers
+  (`RENFIELD_OPENHOME=0` opts out to AVTransport). `SonosBackend` is still
+  **PROVISIONAL** (mock+spec only), opt-in via `RENFIELD_SONOS=1`; `soco` is an
+  optional dep (`pip install '.[sonos]'`).
 - **`metadata.py`** — device-family DIDL/protocolInfo strategy. Audio keeps the
   `*` 4th-field (no regression); video adds DLNA.ORG_OP/FLAGS, TV families
   (Samsung/LG/Sony) get a `DLNA.ORG_PN` seam. Caller `mime_type`/`dlna_features`

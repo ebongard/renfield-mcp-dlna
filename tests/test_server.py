@@ -1876,17 +1876,21 @@ class TestOpenHomeBackend:
 
 
 class TestOpenHomeFactoryRouting:
-    def test_routes_to_openhome_when_env_enabled(self, monkeypatch):
-        monkeypatch.setenv("RENFIELD_OPENHOME", "1")
+    def test_openhome_is_default_for_openhome_renderers(self, monkeypatch):
+        monkeypatch.delenv("RENFIELD_OPENHOME", raising=False)
         r = _make_renderer()
         r.is_openhome = True
         assert isinstance(queue_manager._make_backend(r), OpenHomeBackend)
 
-    def test_defaults_to_avtransport_without_env(self, monkeypatch):
-        monkeypatch.delenv("RENFIELD_OPENHOME", raising=False)
+    def test_opt_out_falls_back_to_avtransport(self, monkeypatch):
+        monkeypatch.setenv("RENFIELD_OPENHOME", "0")
         r = _make_renderer()
         r.is_openhome = True
         assert isinstance(queue_manager._make_backend(r), AvTransportBackend)
+
+    def test_non_openhome_renderer_uses_avtransport(self, monkeypatch):
+        monkeypatch.delenv("RENFIELD_OPENHOME", raising=False)
+        assert isinstance(queue_manager._make_backend(_make_renderer()), AvTransportBackend)
 
 
 class TestQueueSessionOwnsQueue:

@@ -82,17 +82,14 @@ def _make_backend(renderer: DlnaRenderer) -> PlaybackBackend:
         logger.info(f"[{renderer.name}] using SonosBackend (RENFIELD_SONOS=1)")
         return SonosBackend(renderer)
 
-    # OpenHomeBackend is implemented but PROVISIONAL (not yet validated on a real
-    # Linn), so it's opt-in via RENFIELD_OPENHOME=1 — otherwise OpenHome renderers
-    # use the AVTransport they also advertise, preserving today's behaviour.
-    if renderer.is_openhome:
-        if os.getenv("RENFIELD_OPENHOME") == "1":
-            logger.info(f"[{renderer.name}] using OpenHomeBackend (RENFIELD_OPENHOME=1)")
-            return OpenHomeBackend(renderer)
-        logger.debug(
-            f"[{renderer.name}] OpenHome renderer — using AVTransport "
-            f"(set RENFIELD_OPENHOME=1 to use the native Playlist backend)"
-        )
+    # OpenHome renderers (Linn) use the native Playlist backend by DEFAULT — it's
+    # validated end-to-end on real hardware (discovery + volume + playback) and is
+    # the better path (device-owned gapless queue, reliable Volume service vs the
+    # bogus-range RenderingControl workaround). RENFIELD_OPENHOME=0 is the safety
+    # opt-out back to AVTransport.
+    if renderer.is_openhome and os.getenv("RENFIELD_OPENHOME") != "0":
+        logger.info(f"[{renderer.name}] using OpenHomeBackend (native Playlist)")
+        return OpenHomeBackend(renderer)
     return AvTransportBackend(renderer)
 
 

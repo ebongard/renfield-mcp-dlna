@@ -62,7 +62,7 @@ The server listens on `http://0.0.0.0:9091/mcp` (configurable via `MCP_HOST` and
 | `MCP_HOST` | `0.0.0.0` | Bind address (streamable-http only) |
 | `MCP_PORT` | `9091` | Listen port (streamable-http only) |
 | `DLNA_LISTEN_IP` | auto | Override the local IP used for the UPnP event-callback URL (multi-homed hosts) |
-| `RENFIELD_OPENHOME` | unset | `1` routes OpenHome renderers (Linn) to the native Playlist backend (provisional) |
+| `RENFIELD_OPENHOME` | on | OpenHome renderers (Linn) use the native Playlist backend by default (hardware-validated); set `0` to fall back to AVTransport |
 | `RENFIELD_SONOS` | unset | `1` routes Sonos renderers to the `soco`-backed backend (provisional; needs `.[sonos]`) |
 
 ## Deployment as Host Service
