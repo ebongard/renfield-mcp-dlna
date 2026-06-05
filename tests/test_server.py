@@ -1201,3 +1201,139 @@ class TestQueueSessionUsesControlPoint:
         cp.register(s.renderer.udn, s)
         await s._cleanup()
         assert cp.get_session(s.renderer.udn) is None
+
+
+# ---------------------------------------------------------------------------
+# P2: enriched status + get_mute (read-mostly capability surface)
+# ---------------------------------------------------------------------------
+
+class TestBackendReadAccessors:
+    def test_position_and_duration_from_dmr(self):
+        b = _connected_backend()
+        b._dmr.media_position = 42
+        b._dmr.media_duration = 215
+        assert b.media_position == 42
+        assert b.media_duration == 215
+
+    def test_position_none_when_unbound(self):
+        b = AvTransportBackend(_make_renderer())
+        assert b.media_position is None
+        assert b.media_duration is None
+        assert b.capabilities == {}
+
+    def test_capabilities_from_transport_actions(self):
+        b = _connected_backend()
+        b._dmr.can_pause = True
+        b._dmr.can_seek_rel_time = True
+        b._dmr.can_seek_abs_time = False
+        b._dmr.can_next = False
+        b._dmr.can_previous = True
+        caps = b.capabilities
+        assert caps == {
+            "can_pause": True,
+            "can_seek": True,
+            "can_next": False,
+            "can_previous": True,
+        }
+
+    async def test_get_mute_reads_rc(self):
+        b = AvTransportBackend(_make_renderer())
+        b._dmr, calls = _mock_dmr_with_rc()  # GetMute returns CurrentMute False
+        assert await b.get_mute() is False
+        assert "GetMute" in calls
+
+    async def test_get_mute_none_when_action_absent(self):
+        b = AvTransportBackend(_make_renderer())
+        b._dmr, _ = _mock_dmr_with_rc(actions=("GetVolume", "SetVolume"))  # no GetMute
+        assert await b.get_mute() is None
+
+    async def test_get_mute_none_when_unbound(self):
+        b = AvTransportBackend(_make_renderer())
+        assert await b.get_mute() is None
+
+
+class TestStatusEnrichment:
+    def test_status_includes_position_duration_capabilities(self):
+        s = QueueSession(_make_renderer(), _make_tracks(2))
+        s.backend._dmr = MagicMock()
+        s.backend._dmr.media_position = 12
+        s.backend._dmr.media_duration = 200
+        s.backend._dmr.can_pause = True
+        s.backend._dmr.can_seek_rel_time = True
+        s.backend._dmr.can_seek_abs_time = False
+        s.backend._dmr.can_next = True
+        s.backend._dmr.can_previous = False
+        status = s.status()
+        assert status["position"] == 12
+        assert status["duration"] == 200
+        assert status["capabilities"]["can_seek"] is True
+        assert status["capabilities"]["can_next"] is True
+
+    def test_status_keys_present_even_when_unreportable(self):
+        s = QueueSession(_make_renderer(), _make_tracks(1))
+        status = s.status()
+        # Stable shape: keys always present, None/empty when unknown.
+        assert status["position"] is None
+        assert status["duration"] is None
+        assert status["capabilities"] == {}
+
+
+class TestGetMuteTool:
+    async def test_returns_mute_state(self):
+        renderer = _make_renderer()
+        mock_session = MagicMock(spec=QueueSession)
+        mock_session.get_mute = AsyncMock(return_value=True)
+        with (
+            patch.object(discovery, "find_renderer", new_callable=AsyncMock, return_value=renderer),
+            patch.object(queue_manager, "get_session", return_value=mock_session),
+        ):
+            result = await server.get_mute("HiFiBerry")
+            assert result.get("success") is True
+            assert result["muted"] is True
+
+    async def test_muted_none_when_unreportable(self):
+        renderer = _make_renderer()
+        mock_session = MagicMock(spec=QueueSession)
+        mock_session.get_mute = AsyncMock(return_value=None)
+        with (
+            patch.object(discovery, "find_renderer", new_callable=AsyncMock, return_value=renderer),
+            patch.object(queue_manager, "get_session", return_value=mock_session),
+        ):
+            result = await server.get_mute("HiFiBerry")
+            assert result.get("success") is True
+            assert result["muted"] is None
+
+    async def test_no_active_session(self):
+        renderer = _make_renderer()
+        with (
+            patch.object(discovery, "find_renderer", new_callable=AsyncMock, return_value=renderer),
+            patch.object(queue_manager, "get_session", return_value=None),
+        ):
+            result = await server.get_mute("HiFiBerry")
+            assert result.get("success") is False
+            assert "No active playback" in result["error"]
+
+    async def test_renderer_not_found(self):
+        with patch.object(discovery, "find_renderer", new_callable=AsyncMock, return_value=None):
+            result = await server.get_mute("Unknown")
+            assert result.get("success") is False
+            assert "not found" in result["error"]
+
+
+class TestGetStatusEnrichment:
+    async def test_status_tool_adds_volume_and_muted(self):
+        renderer = _make_renderer()
+        mock_session = MagicMock(spec=QueueSession)
+        mock_session.refresh_state = AsyncMock()
+        mock_session.status.return_value = {"renderer": "HiFiBerry Garten", "state": "playing"}
+        mock_session.get_volume = AsyncMock(return_value=44)
+        mock_session.get_mute = AsyncMock(return_value=False)
+        with (
+            patch.object(discovery, "find_renderer", new_callable=AsyncMock, return_value=renderer),
+            patch.object(queue_manager, "get_session", return_value=mock_session),
+        ):
+            result = await server.get_status("HiFiBerry")
+            assert result["state"] == "playing"
+            assert result["volume"] == 44
+            assert result["muted"] is False
+            mock_session.refresh_state.assert_awaited_once()

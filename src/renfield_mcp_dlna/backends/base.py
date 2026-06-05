@@ -137,3 +137,27 @@ class PlaybackBackend(ABC):
     @abstractmethod
     async def set_mute(self, mute: bool) -> None:
         """Mute (True) or unmute (False)."""
+
+    # -- optional read accessors (sane defaults; backends override) --------
+    # Non-abstract so OpenHome/Sonos backends inherit "unknown" until they
+    # implement these, rather than being forced to stub them.
+
+    async def get_mute(self) -> bool | None:
+        """Current mute state, or None if the device can't report it."""
+        return None
+
+    @property
+    def media_position(self) -> int | None:
+        """Current playback position in seconds, or None if unknown."""
+        return None
+
+    @property
+    def media_duration(self) -> int | None:
+        """Current track duration in seconds, or None if unknown."""
+        return None
+
+    @property
+    def capabilities(self) -> dict:
+        """What the device currently permits: can_pause/seek/next/previous.
+        Empty when unknown. Lets the client/LLM adapt to the renderer."""
+        return {}

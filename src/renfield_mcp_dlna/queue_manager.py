@@ -334,6 +334,10 @@ class QueueSession:
         """Current volume (0-100), or None if unreportable."""
         return await self.backend.get_volume()
 
+    async def get_mute(self) -> bool | None:
+        """Current mute state, or None if unreportable."""
+        return await self.backend.get_mute()
+
     async def _cleanup(self) -> None:
         """Remove session from the control point (which shuts the shared infra
         down when the last session leaves)."""
@@ -357,7 +361,13 @@ class QueueSession:
         return state.lower() if state else "unknown"
 
     def status(self) -> dict:
-        """Return current playback status."""
+        """Return current playback status.
+
+        position/duration/capabilities reflect whatever the backend last
+        polled — get_status calls refresh_state() first so they're fresh on
+        event-silent renderers. Keys are always present (None/empty when the
+        renderer can't report them) so the shape is stable for the client.
+        """
         track = self.tracks[self.current_index] if self.tracks else None
         return {
             "renderer": self.renderer.name,
@@ -367,6 +377,9 @@ class QueueSession:
             "title": track.title if track else None,
             "artist": track.artist if track else None,
             "album": track.album if track else None,
+            "position": self.backend.media_position,
+            "duration": self.backend.media_duration,
+            "capabilities": self.backend.capabilities,
         }
 
 

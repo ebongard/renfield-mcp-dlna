@@ -255,7 +255,12 @@ async def get_status(renderer_name: str) -> dict:
     # Actively poll the renderer (GetTransportInfo) so the reported state is
     # accurate even for renderers that don't emit LAST_CHANGE events.
     await session.refresh_state()
-    return session.status()
+    status = session.status()
+    # Volume/mute need async RC reads, so they're added here rather than in the
+    # sync status() snapshot.
+    status["volume"] = await session.get_volume()
+    status["muted"] = await session.get_mute()
+    return status
 
 
 @mcp.tool()
@@ -287,6 +292,21 @@ async def get_volume(renderer_name: str) -> dict:
 
     volume = await session.get_volume()
     return {"success": True, "renderer": renderer.name, "volume": volume}
+
+
+@mcp.tool()
+async def get_mute(renderer_name: str) -> dict:
+    """Get current mute state on a DLNA renderer.
+
+    Returns muted=None if the renderer cannot report it.
+    """
+    try:
+        renderer, session = await _resolve_session(renderer_name)
+    except ToolError as e:
+        return _error(str(e))
+
+    muted = await session.get_mute()
+    return {"success": True, "renderer": renderer.name, "muted": muted}
 
 
 @mcp.tool()

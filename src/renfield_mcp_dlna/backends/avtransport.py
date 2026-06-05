@@ -287,6 +287,50 @@ class AvTransportBackend(PlaybackBackend):
             InstanceID=0, Channel="Master", DesiredMute=mute
         )
 
+    async def get_mute(self) -> bool | None:
+        """Current mute state via direct RC GetMute, or None if unreportable."""
+        rc = self._rendering_control()
+        if rc is None or "GetMute" not in rc.actions:
+            return None
+        try:
+            res = await asyncio.wait_for(
+                rc.action("GetMute").async_call(InstanceID=0, Channel="Master"),
+                timeout=_TRANSPORT_POLL_TIMEOUT,
+            )
+        except Exception:  # noqa: BLE001 - read is best-effort
+            return None
+        cur = res.get("CurrentMute")
+        return bool(cur) if cur is not None else None
+
+    # -- position / duration / capabilities (from DmrDevice) ---------------
+    # These read whatever the last async_update() populated; get_status calls
+    # refresh() first so they reflect a fresh GetPositionInfo/GetTransportInfo.
+
+    @property
+    def media_position(self) -> int | None:
+        return getattr(self._dmr, "media_position", None) if self._dmr else None
+
+    @property
+    def media_duration(self) -> int | None:
+        return getattr(self._dmr, "media_duration", None) if self._dmr else None
+
+    @property
+    def capabilities(self) -> dict:
+        """can_pause/seek/next/previous from the device's current transport
+        actions (DmrDevice exposes these as properties)."""
+        d = self._dmr
+        if d is None:
+            return {}
+        return {
+            "can_pause": bool(getattr(d, "can_pause", False)),
+            "can_seek": bool(
+                getattr(d, "can_seek_rel_time", False)
+                or getattr(d, "can_seek_abs_time", False)
+            ),
+            "can_next": bool(getattr(d, "can_next", False)),
+            "can_previous": bool(getattr(d, "can_previous", False)),
+        }
+
     async def get_volume(self) -> int | None:
         """Current volume (0-100), or None if the renderer can't report it.
 
