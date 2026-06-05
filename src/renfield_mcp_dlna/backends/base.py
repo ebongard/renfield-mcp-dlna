@@ -161,3 +161,18 @@ class PlaybackBackend(ABC):
         """What the device currently permits: can_pause/seek/next/previous.
         Empty when unknown. Lets the client/LLM adapt to the renderer."""
         return {}
+
+    @property
+    def valid_play_modes(self) -> set[str]:
+        """Play modes the renderer accepts (lowercase: normal/repeat_one/
+        repeat_all/shuffle/random), or empty if it reports none."""
+        return set()
+
+    async def seek(self, position_seconds: int) -> None:
+        """Seek to `position_seconds` from the start of the current track.
+        Default: unsupported."""
+        raise RuntimeError("Renderer does not support seek")
+
+    async def set_play_mode(self, mode: str) -> None:
+        """Set the play mode (one of valid_play_modes). Default: unsupported."""
+        raise RuntimeError("Renderer does not support play modes")

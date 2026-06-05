@@ -236,6 +236,55 @@ async def previous_track(renderer_name: str) -> dict:
 
 
 @mcp.tool()
+async def seek(renderer_name: str, position_seconds: int) -> dict:
+    """Seek to a position within the current track.
+
+    Args:
+        renderer_name: Name (or partial name) of the DLNA renderer.
+        position_seconds: Target offset in seconds from the start of the track.
+    """
+    try:
+        renderer, session = await _resolve_session(renderer_name)
+    except ToolError as e:
+        return _error(str(e))
+
+    try:
+        await session.seek(position_seconds)
+        return {
+            "success": True,
+            "renderer": renderer.name,
+            "position": max(0, position_seconds),
+        }
+    except Exception as e:
+        return _error(f"Seek failed: {e}")
+
+
+@mcp.tool()
+async def set_play_mode(renderer_name: str, mode: str) -> dict:
+    """Set the play mode on a DLNA renderer.
+
+    UPnP exposes a single play mode (not independent repeat + shuffle toggles),
+    so setting one replaces the other.
+
+    Args:
+        renderer_name: Name (or partial name) of the DLNA renderer.
+        mode: One of normal, repeat_one, repeat_all, shuffle, random. The
+            renderer's accepted modes are reported as `valid_play_modes` in
+            get_status.
+    """
+    try:
+        renderer, session = await _resolve_session(renderer_name)
+    except ToolError as e:
+        return _error(str(e))
+
+    try:
+        await session.set_play_mode(mode)
+        return {"success": True, "renderer": renderer.name, "play_mode": mode.strip().lower()}
+    except Exception as e:
+        return _error(f"Failed to set play mode: {e}")
+
+
+@mcp.tool()
 async def get_status(renderer_name: str) -> dict:
     """Get current playback status, track info, and queue position."""
     try:

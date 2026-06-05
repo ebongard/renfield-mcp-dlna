@@ -2,9 +2,11 @@
 
 import asyncio
 import json
+from datetime import timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from async_upnp_client.profiles.dlna import PlayMode
 
 from renfield_mcp_dlna import control_point as cp_module
 from renfield_mcp_dlna import discovery, queue_manager, server
@@ -1337,3 +1339,120 @@ class TestGetStatusEnrichment:
             assert result["volume"] == 44
             assert result["muted"] is False
             mock_session.refresh_state.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# P2: seek + play mode (write actions, capability-gated)
+# ---------------------------------------------------------------------------
+
+class TestBackendSeekPlayMode:
+    async def test_seek_calls_rel_time_when_supported(self):
+        b = _connected_backend()
+        b._dmr.can_seek_rel_time = True
+        b._dmr.async_seek_rel_time = AsyncMock()
+        await b.seek(90)
+        b._dmr.async_seek_rel_time.assert_awaited_once_with(timedelta(seconds=90))
+
+    async def test_seek_clamps_negative_to_zero(self):
+        b = _connected_backend()
+        b._dmr.can_seek_rel_time = True
+        b._dmr.async_seek_rel_time = AsyncMock()
+        await b.seek(-5)
+        b._dmr.async_seek_rel_time.assert_awaited_once_with(timedelta(seconds=0))
+
+    async def test_seek_raises_when_unsupported(self):
+        b = _connected_backend()
+        b._dmr.can_seek_rel_time = False
+        with pytest.raises(RuntimeError, match="does not support seek"):
+            await b.seek(10)
+
+    async def test_seek_raises_when_unbound(self):
+        b = AvTransportBackend(_make_renderer())
+        with pytest.raises(RuntimeError, match="No active playback"):
+            await b.seek(10)
+
+    def test_valid_play_modes_normalized_to_lowercase(self):
+        b = _connected_backend()
+        b._dmr.valid_play_modes = {PlayMode.NORMAL, PlayMode.SHUFFLE, PlayMode.REPEAT_ALL}
+        assert b.valid_play_modes == {"normal", "shuffle", "repeat_all"}
+
+    def test_valid_play_modes_empty_when_unbound(self):
+        b = AvTransportBackend(_make_renderer())
+        assert b.valid_play_modes == set()
+
+    async def test_set_play_mode_valid(self):
+        b = _connected_backend()
+        b._dmr.valid_play_modes = {PlayMode.NORMAL, PlayMode.SHUFFLE}
+        b._dmr.async_set_play_mode = AsyncMock()
+        await b.set_play_mode("shuffle")
+        b._dmr.async_set_play_mode.assert_awaited_once_with(PlayMode.SHUFFLE)
+
+    async def test_set_play_mode_rejects_unsupported_mode(self):
+        b = _connected_backend()
+        b._dmr.valid_play_modes = {PlayMode.NORMAL}
+        with pytest.raises(RuntimeError, match="does not support play mode"):
+            await b.set_play_mode("random")
+
+
+class TestSeekTool:
+    async def test_seek_success(self):
+        renderer = _make_renderer()
+        mock_session = MagicMock(spec=QueueSession)
+        mock_session.seek = AsyncMock()
+        with (
+            patch.object(discovery, "find_renderer", new_callable=AsyncMock, return_value=renderer),
+            patch.object(queue_manager, "get_session", return_value=mock_session),
+        ):
+            result = await server.seek("HiFiBerry", 75)
+            assert result.get("success") is True
+            assert result["position"] == 75
+            mock_session.seek.assert_awaited_once_with(75)
+
+    async def test_seek_failure_surfaced(self):
+        renderer = _make_renderer()
+        mock_session = MagicMock(spec=QueueSession)
+        mock_session.seek = AsyncMock(side_effect=RuntimeError("does not support seek"))
+        with (
+            patch.object(discovery, "find_renderer", new_callable=AsyncMock, return_value=renderer),
+            patch.object(queue_manager, "get_session", return_value=mock_session),
+        ):
+            result = await server.seek("HiFiBerry", 10)
+            assert result.get("success") is False
+            assert "Seek failed" in result["error"]
+
+    async def test_seek_no_session(self):
+        renderer = _make_renderer()
+        with (
+            patch.object(discovery, "find_renderer", new_callable=AsyncMock, return_value=renderer),
+            patch.object(queue_manager, "get_session", return_value=None),
+        ):
+            result = await server.seek("HiFiBerry", 10)
+            assert result.get("success") is False
+            assert "No active playback" in result["error"]
+
+
+class TestSetPlayModeTool:
+    async def test_set_play_mode_success(self):
+        renderer = _make_renderer()
+        mock_session = MagicMock(spec=QueueSession)
+        mock_session.set_play_mode = AsyncMock()
+        with (
+            patch.object(discovery, "find_renderer", new_callable=AsyncMock, return_value=renderer),
+            patch.object(queue_manager, "get_session", return_value=mock_session),
+        ):
+            result = await server.set_play_mode("HiFiBerry", "Shuffle")
+            assert result.get("success") is True
+            assert result["play_mode"] == "shuffle"  # normalized
+            mock_session.set_play_mode.assert_awaited_once_with("Shuffle")
+
+    async def test_set_play_mode_failure_surfaced(self):
+        renderer = _make_renderer()
+        mock_session = MagicMock(spec=QueueSession)
+        mock_session.set_play_mode = AsyncMock(side_effect=RuntimeError("does not support play mode 'random'"))
+        with (
+            patch.object(discovery, "find_renderer", new_callable=AsyncMock, return_value=renderer),
+            patch.object(queue_manager, "get_session", return_value=mock_session),
+        ):
+            result = await server.set_play_mode("HiFiBerry", "random")
+            assert result.get("success") is False
+            assert "Failed to set play mode" in result["error"]

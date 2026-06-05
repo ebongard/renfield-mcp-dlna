@@ -338,6 +338,14 @@ class QueueSession:
         """Current mute state, or None if unreportable."""
         return await self.backend.get_mute()
 
+    async def seek(self, position_seconds: int) -> None:
+        """Seek to a position (seconds) within the current track."""
+        await self.backend.seek(position_seconds)
+
+    async def set_play_mode(self, mode: str) -> None:
+        """Set the play mode (normal/repeat_one/repeat_all/shuffle/random)."""
+        await self.backend.set_play_mode(mode)
+
     async def _cleanup(self) -> None:
         """Remove session from the control point (which shuts the shared infra
         down when the last session leaves)."""
@@ -380,6 +388,7 @@ class QueueSession:
             "position": self.backend.media_position,
             "duration": self.backend.media_duration,
             "capabilities": self.backend.capabilities,
+            "valid_play_modes": sorted(self.backend.valid_play_modes),
         }
 
 

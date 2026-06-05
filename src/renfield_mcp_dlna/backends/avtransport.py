@@ -15,10 +15,11 @@ Event flow:
 
 import asyncio
 import logging
+from datetime import timedelta
 
 from async_upnp_client.client_factory import UpnpFactory
 from async_upnp_client.event_handler import UpnpEventHandler
-from async_upnp_client.profiles.dlna import DmrDevice
+from async_upnp_client.profiles.dlna import DmrDevice, PlayMode
 
 from ..discovery import DlnaRenderer
 from .base import PlaybackBackend, TransportEvent
@@ -330,6 +331,38 @@ class AvTransportBackend(PlaybackBackend):
             "can_next": bool(getattr(d, "can_next", False)),
             "can_previous": bool(getattr(d, "can_previous", False)),
         }
+
+    @property
+    def valid_play_modes(self) -> set[str]:
+        if self._dmr is None:
+            return set()
+        try:
+            return {str(getattr(m, "value", m)).lower() for m in self._dmr.valid_play_modes}
+        except Exception:  # noqa: BLE001 - absent/odd state var → none
+            return set()
+
+    async def seek(self, position_seconds: int) -> None:
+        """Seek to an absolute offset within the current track (UPnP REL_TIME).
+
+        REL_TIME is, confusingly, the position relative to the *start of the
+        track* — i.e. where most UIs mean by "seek to 1:30".
+        """
+        if self._dmr is None:
+            raise RuntimeError("No active playback session")
+        if not getattr(self._dmr, "can_seek_rel_time", False):
+            raise RuntimeError("Renderer does not support seek")
+        await self._dmr.async_seek_rel_time(timedelta(seconds=max(0, position_seconds)))
+
+    async def set_play_mode(self, mode: str) -> None:
+        if self._dmr is None:
+            raise RuntimeError("No active playback session")
+        normalized = mode.strip().lower()
+        if normalized not in self.valid_play_modes:
+            raise RuntimeError(
+                f"Renderer does not support play mode '{mode}' "
+                f"(supports: {sorted(self.valid_play_modes) or 'none'})"
+            )
+        await self._dmr.async_set_play_mode(PlayMode(normalized.upper()))
 
     async def get_volume(self) -> int | None:
         """Current volume (0-100), or None if the renderer can't report it.
