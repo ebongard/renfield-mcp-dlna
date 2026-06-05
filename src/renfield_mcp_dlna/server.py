@@ -269,6 +269,28 @@ async def get_volume(renderer_name: str) -> dict:
     return {"success": True, "renderer": renderer.name, "volume": volume}
 
 
+@mcp.tool()
+async def set_mute(renderer_name: str, mute: bool) -> dict:
+    """Mute (mute=true) or unmute (mute=false) a DLNA renderer.
+
+    Uses native RenderingControl SetMute — the renderer restores the prior
+    volume on unmute, so no volume value needs to be stored.
+    """
+    renderer = await discovery.find_renderer(renderer_name)
+    if not renderer:
+        return {"success": False, "error": f"Renderer '{renderer_name}' not found"}
+
+    session = queue_manager.get_session(renderer.udn)
+    if not session:
+        return {"success": False, "error": f"No active playback on '{renderer.name}'"}
+
+    try:
+        await session.set_mute(mute)
+        return {"success": True, "renderer": renderer.name, "muted": mute}
+    except Exception as e:
+        return {"success": False, "error": f"Failed to set mute: {e}"}
+
+
 def main():
     """Entry point for console script and python -m.
 

@@ -435,6 +435,20 @@ class QueueSession:
         # without waiting for the renderer's echoed Volume event.
         self._volume = volume
 
+    async def set_mute(self, mute: bool) -> None:
+        """Mute (True) or unmute (False) via native RenderingControl SetMute.
+
+        On renderers that support it, mute is tracked independently of the
+        volume level, so unmute restores the prior volume without us storing it.
+        Renderers without RC/SetMute raise a clear error rather than a generic
+        UpnpError.
+        """
+        if self._dmr is None:
+            raise RuntimeError("No active playback session")
+        if not self._dmr.has_volume_mute:
+            raise RuntimeError("Renderer does not support mute")
+        await self._dmr.async_mute_volume(mute)
+
     async def get_volume(self) -> int | None:
         """Current volume (0-100), or None if the renderer can't report it.
 
