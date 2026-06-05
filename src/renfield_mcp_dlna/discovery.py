@@ -109,9 +109,13 @@ def _base_url_from_location(location: str) -> str:
 
 
 async def _ssdp_search_single(
-    search_target: str, timeout: float = 6.0
+    search_target: str, timeout: float = 6.0, source_ip: str | None = None
 ) -> list[str]:
-    """Send SSDP M-SEARCH for a single ST and collect LOCATION URLs."""
+    """Send SSDP M-SEARCH for a single ST and collect LOCATION URLs.
+
+    source_ip binds the socket to a specific local interface (for multi-homed
+    hosts). None keeps the default-route behaviour (unchanged).
+    """
     locations: list[str] = []
     msg = _build_msearch(search_target)
 
@@ -122,6 +126,13 @@ async def _ssdp_search_single(
         socket.IP_MULTICAST_TTL,
         struct.pack("b", 4),
     )
+    if source_ip:
+        # Send the multicast query out of this specific interface. On failure
+        # (interface gone) the caller treats the whole search as empty.
+        sock.bind((source_ip, 0))
+        sock.setsockopt(
+            socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(source_ip)
+        )
     # Keep socket blocking — recv is run in executor thread.
     # select() provides the timeout; recv() blocks until data arrives.
     sock.setblocking(True)
@@ -169,22 +180,58 @@ async def _ssdp_search_single(
     return locations
 
 
+def _local_ipv4_addresses() -> list[str]:
+    """Best-effort list of this host's non-loopback IPv4 interface addresses.
+
+    Used to M-SEARCH from every interface on a multi-homed host. Returns [] if
+    enumeration isn't available (ifaddr missing / error), in which case discovery
+    falls back to the default-route search only — no regression.
+    """
+    try:
+        import ifaddr
+    except Exception:  # noqa: BLE001 - optional; default-route path still works
+        return []
+    addrs: list[str] = []
+    try:
+        for adapter in ifaddr.get_adapters():
+            for ip in adapter.ips:
+                addr = ip.ip
+                # IPv4 ips are plain strings; IPv6 are (addr, flowinfo, scope) tuples.
+                if isinstance(addr, str) and not addr.startswith("127."):
+                    addrs.append(addr)
+    except Exception:  # noqa: BLE001 - best-effort
+        return []
+    return addrs
+
+
 async def _ssdp_search(timeout: float = 5.0) -> list[str]:
     """Send SSDP M-SEARCH for MediaRenderer and rootdevice, merge results.
 
     Some devices (e.g. Linn/ohNet) don't respond to the MediaRenderer search
     target but do support AVTransport. Searching for upnp:rootdevice as well
     catches these devices.  Filtering by AVTransport happens later.
+
+    Additive multi-interface: always runs the default-route search (unchanged),
+    PLUS one search per local interface on multi-homed hosts. Per-interface
+    failures are swallowed so they can't break the default path.
     """
-    results = await asyncio.gather(
-        _ssdp_search_single(_SEARCH_TARGET, timeout),
-        _ssdp_search_single("upnp:rootdevice", timeout),
-    )
-    # Merge and deduplicate
+    targets = (_SEARCH_TARGET, "upnp:rootdevice")
+    searches = [_ssdp_search_single(st, timeout) for st in targets]  # default route
+    for source_ip in _local_ipv4_addresses():
+        searches.extend(
+            _ssdp_search_single(st, timeout, source_ip=source_ip) for st in targets
+        )
+
+    results = await asyncio.gather(*searches, return_exceptions=True)
+    # Merge and deduplicate; ignore any per-search exception (e.g. an interface
+    # that vanished).
     seen: set[str] = set()
     locations: list[str] = []
-    for loc_list in results:
-        for loc in loc_list:
+    for result in results:
+        if isinstance(result, BaseException):
+            logger.debug(f"SSDP search leg failed: {result}")
+            continue
+        for loc in result:
             if loc not in seen:
                 seen.add(loc)
                 locations.append(loc)

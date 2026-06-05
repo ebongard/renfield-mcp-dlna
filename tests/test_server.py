@@ -2001,3 +2001,59 @@ class TestSonosDetection:
         )
         assert r is not None
         assert r.is_sonos is True
+
+
+# ---------------------------------------------------------------------------
+# T1 (partial): additive multi-interface M-SEARCH fan-out
+# ---------------------------------------------------------------------------
+
+class TestMultiInterfaceSearch:
+    def test_local_ipv4_excludes_loopback_and_ipv6(self, monkeypatch):
+        import sys
+        import types
+
+        class _IP:
+            def __init__(self, ip):
+                self.ip = ip
+
+        class _Adapter:
+            def __init__(self, ips):
+                self.ips = ips
+
+        fake = types.SimpleNamespace(get_adapters=lambda: [
+            _Adapter([_IP("127.0.0.1"), _IP("10.0.0.5")]),
+            _Adapter([_IP(("fe80::1", 0, 0))]),  # IPv6 tuple → skipped
+        ])
+        monkeypatch.setitem(sys.modules, "ifaddr", fake)
+        assert discovery._local_ipv4_addresses() == ["10.0.0.5"]
+
+    def test_local_ipv4_empty_when_ifaddr_unavailable(self, monkeypatch):
+        import sys
+        monkeypatch.setitem(sys.modules, "ifaddr", None)  # import → ImportError
+        assert discovery._local_ipv4_addresses() == []
+
+    async def test_search_fans_out_over_interfaces(self, monkeypatch):
+        calls = []
+
+        async def _fake_single(st, timeout, source_ip=None):
+            calls.append(source_ip)
+            return [f"http://{source_ip or 'default'}/d.xml"]
+
+        monkeypatch.setattr(discovery, "_ssdp_search_single", _fake_single)
+        monkeypatch.setattr(discovery, "_local_ipv4_addresses", lambda: ["10.0.0.5"])
+        locs = await discovery._ssdp_search(timeout=0.01)
+        # 2 search targets × (default-route + one interface)
+        assert calls.count(None) == 2
+        assert calls.count("10.0.0.5") == 2
+        assert any("10.0.0.5" in loc for loc in locs)
+
+    async def test_search_swallows_per_interface_failure(self, monkeypatch):
+        async def _fake_single(st, timeout, source_ip=None):
+            if source_ip == "10.0.0.5":
+                raise OSError("interface vanished")
+            return ["http://default/d.xml"]
+
+        monkeypatch.setattr(discovery, "_ssdp_search_single", _fake_single)
+        monkeypatch.setattr(discovery, "_local_ipv4_addresses", lambda: ["10.0.0.5"])
+        # The default-route legs still succeed despite the interface leg raising.
+        assert await discovery._ssdp_search(timeout=0.01) == ["http://default/d.xml"]
