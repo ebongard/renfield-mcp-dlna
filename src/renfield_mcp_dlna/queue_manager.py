@@ -456,7 +456,10 @@ class QueueSession:
         if level is None:
             return None
         vol = round(level * 100)
-        self._volume = vol
+        # A Volume event may have landed via _on_event while async_update() ran;
+        # that value is fresher than this poll, so don't clobber it.
+        if self._volume is None:
+            self._volume = vol
         return vol
 
     async def _cleanup(self) -> None:
