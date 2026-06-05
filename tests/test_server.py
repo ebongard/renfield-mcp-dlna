@@ -6,9 +6,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from renfield_mcp_dlna import control_point as cp_module
 from renfield_mcp_dlna import discovery, queue_manager, server
 from renfield_mcp_dlna.backends import avtransport
 from renfield_mcp_dlna.backends.avtransport import AvTransportBackend
+from renfield_mcp_dlna.control_point import ControlPoint
 from renfield_mcp_dlna.didl import build_didl_metadata
 from renfield_mcp_dlna.discovery import DlnaRenderer
 from renfield_mcp_dlna.queue_manager import QueueSession, Track
@@ -1113,3 +1115,89 @@ class TestBackendFactoryOpenHome:
         renderer.is_openhome = True
         backend = queue_manager._make_backend(renderer)
         assert isinstance(backend, AvTransportBackend)
+
+
+# ---------------------------------------------------------------------------
+# ControlPoint (owns shared UPnP infra + session registry)
+# ---------------------------------------------------------------------------
+
+class TestControlPoint:
+    def test_session_registry(self):
+        cp = ControlPoint()
+        sess = object()
+        cp.register("udn:1", sess)
+        assert cp.get_session("udn:1") is sess
+        assert cp.get_all_sessions() == {"udn:1": sess}
+        assert cp.get_session("udn:missing") is None
+        # get_all_sessions returns a copy, not the live dict
+        cp.get_all_sessions()["udn:2"] = object()
+        assert cp.get_session("udn:2") is None
+
+    async def test_unregister_closes_infra_when_last_session_leaves(self):
+        cp = ControlPoint()
+        cp.register("udn:1", object())
+        cp.aclose = AsyncMock()
+        await cp.unregister("udn:1")
+        assert cp.get_all_sessions() == {}
+        cp.aclose.assert_awaited_once()
+
+    async def test_unregister_keeps_infra_while_sessions_remain(self):
+        cp = ControlPoint()
+        cp.register("a", object())
+        cp.register("b", object())
+        cp.aclose = AsyncMock()
+        await cp.unregister("a")
+        cp.aclose.assert_not_awaited()
+        assert set(cp.get_all_sessions()) == {"b"}
+
+    async def test_ensure_started_idempotent_when_already_started(self):
+        cp = ControlPoint()
+        cp._notify_server = MagicMock()  # pretend already started
+        await cp.ensure_started()  # returns immediately, builds nothing
+        assert cp.factory is None  # untouched
+
+    async def test_ensure_started_starts_exactly_once_under_concurrency(self, monkeypatch):
+        # Race-safe lazy init (code review issue #2): three concurrent first
+        # plays must bind the notify server only once.
+        starts = {"n": 0}
+
+        async def _start():
+            starts["n"] += 1
+
+        fake_server = MagicMock()
+        fake_server.async_start_server = AsyncMock(side_effect=_start)
+        fake_server.callback_url = "http://127.0.0.1:0/cb"
+        monkeypatch.setattr(cp_module, "AiohttpRequester", MagicMock())
+        monkeypatch.setattr(cp_module, "AiohttpNotifyServer", MagicMock(return_value=fake_server))
+        monkeypatch.setattr(cp_module, "UpnpEventHandler", MagicMock())
+        monkeypatch.setattr(cp_module, "UpnpFactory", MagicMock())
+        monkeypatch.setattr(cp_module, "detect_local_ip", lambda: "127.0.0.1")
+
+        cp = ControlPoint()
+        await asyncio.gather(cp.ensure_started(), cp.ensure_started(), cp.ensure_started())
+        assert starts["n"] == 1
+        assert cp.started is True
+        assert cp.factory is not None
+
+    def test_detect_local_ip_honours_env_override(self, monkeypatch):
+        monkeypatch.setenv("DLNA_LISTEN_IP", "10.0.0.5")
+        assert cp_module.detect_local_ip() == "10.0.0.5"
+
+
+class TestQueueSessionUsesControlPoint:
+    def test_session_defaults_to_module_control_point(self):
+        s = QueueSession(_make_renderer(), _make_tracks(1))
+        assert s.control_point is queue_manager._default_control_point
+
+    def test_session_accepts_injected_control_point(self):
+        cp = ControlPoint()
+        s = QueueSession(_make_renderer(), _make_tracks(1), control_point=cp)
+        assert s.control_point is cp
+
+    async def test_cleanup_unregisters_from_its_control_point(self):
+        cp = ControlPoint()
+        cp.aclose = AsyncMock()
+        s = QueueSession(_make_renderer(), _make_tracks(1), control_point=cp)
+        cp.register(s.renderer.udn, s)
+        await s._cleanup()
+        assert cp.get_session(s.renderer.udn) is None

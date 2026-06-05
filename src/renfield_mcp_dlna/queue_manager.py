@@ -24,79 +24,23 @@ Auto-advance / gapless state machine (driven by _on_transport_event):
 
 import asyncio
 import logging
-import os
-import socket
 import time
 from dataclasses import dataclass
 
-from async_upnp_client.aiohttp import AiohttpNotifyServer, AiohttpRequester
-from async_upnp_client.client_factory import UpnpFactory
-from async_upnp_client.event_handler import UpnpEventHandler
-
 from .backends import AvTransportBackend, PlaybackBackend
 from .backends.base import TRANSPORT_DEAD, TRANSPORT_OK
+from .control_point import ControlPoint
 from .discovery import DlnaRenderer
 
 logger = logging.getLogger(__name__)
-
-# Module-level shared UPnP event infrastructure
-_requester: AiohttpRequester | None = None
-_notify_server: AiohttpNotifyServer | None = None
-_event_handler: UpnpEventHandler | None = None
-_factory: UpnpFactory | None = None
-
-# Session registry: renderer UDN → QueueSession
-_sessions: dict[str, "QueueSession"] = {}
 
 # How long start() waits for the renderer to confirm it began playing.
 _PLAYBACK_CONFIRM_TIMEOUT = 5.0
 _PLAYBACK_CONFIRM_INTERVAL = 0.5
 
-
-def _detect_local_ip() -> str:
-    """Detect local IP that can reach the network (for UPnP callback URL)."""
-    env_ip = os.environ.get("DLNA_LISTEN_IP")
-    if env_ip:
-        return env_ip
-    # Connect to a public IP to determine our local interface
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(("239.255.255.250", 1900))
-        return s.getsockname()[0]
-    except Exception:
-        return "0.0.0.0"
-    finally:
-        s.close()
-
-
-async def _ensure_infrastructure() -> None:
-    """Start shared notify server + event handler (idempotent)."""
-    global _requester, _notify_server, _event_handler, _factory
-    if _notify_server is not None:
-        return
-
-    source_ip = _detect_local_ip()
-    _requester = AiohttpRequester()
-    _notify_server = AiohttpNotifyServer(
-        requester=_requester,
-        source=(source_ip, 0),  # OS picks free port
-    )
-    _event_handler = UpnpEventHandler(_notify_server, _requester)
-    _factory = UpnpFactory(_requester)
-    await _notify_server.async_start_server()
-    logger.info(
-        f"UPnP notify server started on {source_ip}, "
-        f"callback: {_notify_server.callback_url}"
-    )
-
-
-async def _shutdown_infrastructure() -> None:
-    """Stop notify server when no sessions remain."""
-    global _notify_server, _requester, _event_handler, _factory
-    if _notify_server:
-        await _notify_server.async_stop_server()
-        logger.info("UPnP notify server stopped")
-    _notify_server = _requester = _event_handler = _factory = None
+# Default control point backing the module-level play_tracks/get_session facade.
+# Owns the shared UPnP infra + session registry that used to be module globals.
+_default_control_point = ControlPoint()
 
 
 @dataclass
@@ -136,9 +80,15 @@ class QueueSession:
     renderers.
     """
 
-    def __init__(self, renderer: DlnaRenderer, tracks: list[Track]):
+    def __init__(
+        self,
+        renderer: DlnaRenderer,
+        tracks: list[Track],
+        control_point: ControlPoint | None = None,
+    ):
         self.renderer = renderer
         self.tracks = tracks
+        self.control_point = control_point or _default_control_point
         self.current_index = 0
         self.backend: PlaybackBackend = _make_backend(renderer)
         self._preloaded_index: int | None = None
@@ -166,14 +116,14 @@ class QueueSession:
 
     async def start(self) -> None:
         """Connect + subscribe, play track 1, preload track 2."""
-        await _ensure_infrastructure()
-        assert _factory is not None
-        assert _event_handler is not None
+        await self.control_point.ensure_started()
+        assert self.control_point.factory is not None
+        assert self.control_point.event_handler is not None
 
         await self.backend.connect(
             self._on_transport_event,
-            factory=_factory,
-            event_handler=_event_handler,
+            factory=self.control_point.factory,
+            event_handler=self.control_point.event_handler,
         )
 
         track = self.tracks[0]
@@ -385,12 +335,9 @@ class QueueSession:
         return await self.backend.get_volume()
 
     async def _cleanup(self) -> None:
-        """Remove session from registry, shutdown infra if last."""
-        udn = self.renderer.udn
-        if udn in _sessions:
-            del _sessions[udn]
-        if not _sessions:
-            await _shutdown_infrastructure()
+        """Remove session from the control point (which shuts the shared infra
+        down when the last session leaves)."""
+        await self.control_point.unregister(self.renderer.udn)
 
     def _playback_state(self) -> str:
         """Map the renderer's last reported TransportState to a status string.
@@ -423,21 +370,27 @@ class QueueSession:
         }
 
 
-async def play_tracks(renderer: DlnaRenderer, tracks: list[Track]) -> QueueSession:
+async def play_tracks(
+    renderer: DlnaRenderer,
+    tracks: list[Track],
+    control_point: ControlPoint | None = None,
+) -> QueueSession:
     """Create and start a new queue session, replacing any existing one."""
+    cp = control_point or _default_control_point
+
     # Stop existing session on this renderer
-    existing = _sessions.get(renderer.udn)
+    existing = cp.get_session(renderer.udn)
     if existing:
         await existing.stop()
 
-    session = QueueSession(renderer, tracks)
-    _sessions[renderer.udn] = session
+    session = QueueSession(renderer, tracks, control_point=cp)
+    cp.register(renderer.udn, session)
     try:
         await session.start()
     except Exception:
         # start() failed (e.g. the renderer never began playback) — don't leave
         # a dead session registered claiming a renderer.
-        _sessions.pop(renderer.udn, None)
+        cp.sessions.pop(renderer.udn, None)
         try:
             await session.stop()
         except Exception:
@@ -447,10 +400,10 @@ async def play_tracks(renderer: DlnaRenderer, tracks: list[Track]) -> QueueSessi
 
 
 def get_session(udn: str) -> QueueSession | None:
-    """Get active session for a renderer."""
-    return _sessions.get(udn)
+    """Get active session for a renderer (from the default control point)."""
+    return _default_control_point.get_session(udn)  # type: ignore[return-value]
 
 
 def get_all_sessions() -> dict[str, QueueSession]:
-    """Get all active sessions."""
-    return dict(_sessions)
+    """Get all active sessions (from the default control point)."""
+    return _default_control_point.get_all_sessions()  # type: ignore[return-value]
