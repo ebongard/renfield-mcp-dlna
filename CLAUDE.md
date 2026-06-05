@@ -28,11 +28,10 @@ Requires Python >= 3.11.
 
 ## Architecture
 
-> Mid-refactor: an active plan in `tasks/todo.md` is migrating this toward a
-> full UPnP control point (renderers + MediaServers, per-device-class backends,
-> live discovery). Phase 1 landed the `PlaybackBackend` seam + `ControlPoint`;
-> later phases add OpenHome/Sonos backends, MediaServer browsing, and a
-> library-backed SSDP listener. Read `tasks/todo.md` before extending.
+> Now a full UPnP control point: renderers + MediaServers, per-device-class
+> backends (AVTransport / OpenHome / Sonos), live SSDP-listener discovery, and a
+> session watchdog — built and (mostly) hardware-validated. Remaining items and
+> validation status are in `tasks/todo.md`; read it before extending.
 
 Source modules under `src/renfield_mcp_dlna/`, layered:
 
@@ -49,8 +48,13 @@ Source modules under `src/renfield_mcp_dlna/`, layered:
 - **`control_point.py`** — `ControlPoint` owns the shared UPnP infra (requester
   / notify server / event handler / factory) and the per-UDN session registry.
   `ensure_started()` closes the lazy-init race with a double-checked lock;
-  `unregister()` tears the infra down when the last session leaves. This is the
-  intended home for the SSDP listener + device registry (later phases).
+  `unregister()` tears the infra down when the last session leaves. Also owns the
+  background tasks (streamable-http only, started in `server.main`): a passive
+  **SSDP listener** (`start_discovery_listener` → debounced discovery refresh on
+  alive/byebye, so the cache stays live) and a read-only **session watchdog**
+  (`start_session_watchdog` → periodic `refresh_state`; never touches the queue —
+  GENA renewal stays with the library's `auto_resubscribe`). `stop_background_tasks`
+  cancels both on shutdown.
 - **`backends/`** — `PlaybackBackend` ABC (`base.py`) + three impls. The backend
   owns **all device I/O**. `AvTransportBackend` (default, client-owned queue:
   `DmrDevice`, RenderingControl volume/mute, polling, raw `LAST_CHANGE` parsing).

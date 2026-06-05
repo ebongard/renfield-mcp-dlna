@@ -37,8 +37,12 @@ handled gracefully); HiFiBerryOS reported duration=0 at stream start (position w
   fully validated (discovery + volume + playback); still env-gated by default (flipping all Linn
   off AVTransport is the user's call).
 
-Still unproven on hardware: Sonos (no unit on this LAN), TV video metadata; the passive SSDP
-listener + GENA watchdog are deliberately not built.
+- ✅ **Passive SSDP listener + session watchdog BUILT** (`control_point.start_discovery_listener`
+  / `start_session_watchdog`, wired into streamable-http `server.main`). Listener live-validated:
+  real announcements populated 6 renderers + Jellyfin with no explicit list call. Watchdog is
+  read-only (`refresh_state`); GENA renewal stays with the library's `auto_resubscribe`.
+
+Still unproven on hardware: Sonos (no unit on this LAN), TV video metadata.
 
 ---
 

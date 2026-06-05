@@ -2179,3 +2179,123 @@ class TestOpenHomeRealTransportState:
         b._device, _ = _mock_openhome_device()  # only Playlist + Volume
         b._transport_state = "PLAYING"
         assert await b.query_transport_state() == "PLAYING"
+
+
+# ---------------------------------------------------------------------------
+# SSDP listener (live cache) + session watchdog — ControlPoint background tasks
+# ---------------------------------------------------------------------------
+
+class TestSsdpListener:
+    async def test_schedule_refresh_debounces_a_burst(self, monkeypatch):
+        monkeypatch.setattr(cp_module, "_SSDP_REFRESH_DEBOUNCE", 0.05)
+        cp = ControlPoint()
+        calls = {"n": 0}
+
+        async def on_change():
+            calls["n"] += 1
+
+        cp._on_change = on_change
+        cp._schedule_refresh()
+        cp._schedule_refresh()
+        cp._schedule_refresh()  # burst — should coalesce
+        await asyncio.sleep(0.15)
+        assert calls["n"] == 1
+        await cp.stop_background_tasks()
+
+    async def test_callback_only_fires_on_relevant_sources(self, monkeypatch):
+        from async_upnp_client.const import SsdpSource
+
+        captured = {}
+
+        class _FakeListener:
+            def __init__(self, async_callback=None, **kw):
+                captured["cb"] = async_callback
+
+            async def async_start(self):
+                pass
+
+            async def async_stop(self):
+                pass
+
+        monkeypatch.setattr(
+            "async_upnp_client.ssdp_listener.SsdpListener", _FakeListener
+        )
+        cp = ControlPoint()
+        await cp.start_discovery_listener(AsyncMock())
+        cb = captured["cb"]
+
+        await cb(MagicMock(), "x", SsdpSource.ADVERTISEMENT_ALIVE)
+        assert cp._refresh_task is not None  # relevant → scheduled
+        cp._refresh_task.cancel()
+        cp._refresh_task = None
+
+        await cb(MagicMock(), "x", SsdpSource.SEARCH)
+        assert cp._refresh_task is None  # plain search response → ignored
+        await cp.stop_background_tasks()
+
+    async def test_start_discovery_listener_idempotent(self, monkeypatch):
+        class _FakeListener:
+            def __init__(self, **kw):
+                pass
+
+            async def async_start(self):
+                pass
+
+            async def async_stop(self):
+                pass
+
+        monkeypatch.setattr(
+            "async_upnp_client.ssdp_listener.SsdpListener", _FakeListener
+        )
+        cp = ControlPoint()
+        await cp.start_discovery_listener(AsyncMock())
+        first = cp._ssdp_listener
+        await cp.start_discovery_listener(AsyncMock())
+        assert cp._ssdp_listener is first  # not restarted
+        await cp.stop_background_tasks()
+
+    async def test_stop_background_tasks_stops_listener(self):
+        cp = ControlPoint()
+        listener = MagicMock()
+        listener.async_stop = AsyncMock()
+        cp._ssdp_listener = listener
+        await cp.stop_background_tasks()
+        listener.async_stop.assert_awaited_once()
+        assert cp._ssdp_listener is None
+
+
+class TestSessionWatchdog:
+    async def test_watchdog_refreshes_sessions_read_only(self):
+        cp = ControlPoint()
+        sess = MagicMock()
+        sess.refresh_state = AsyncMock()
+        cp.register("u", sess)
+        await cp.start_session_watchdog(interval=0.05)
+        await asyncio.sleep(0.13)
+        await cp.stop_background_tasks()
+        assert sess.refresh_state.await_count >= 1
+        # watchdog only ever calls refresh_state — never queue ops
+        sess.next.assert_not_called()
+        sess.stop.assert_not_called()
+
+    async def test_watchdog_survives_a_session_refresh_error(self):
+        cp = ControlPoint()
+        bad = MagicMock()
+        bad.refresh_state = AsyncMock(side_effect=RuntimeError("device gone"))
+        good = MagicMock()
+        good.refresh_state = AsyncMock()
+        cp.register("bad", bad)
+        cp.register("good", good)
+        await cp.start_session_watchdog(interval=0.05)
+        await asyncio.sleep(0.13)
+        await cp.stop_background_tasks()
+        # the bad session's error didn't stop the loop reaching the good one
+        assert good.refresh_state.await_count >= 1
+
+    async def test_watchdog_idempotent_start(self):
+        cp = ControlPoint()
+        await cp.start_session_watchdog(interval=10)
+        first = cp._watchdog_task
+        await cp.start_session_watchdog(interval=10)
+        assert cp._watchdog_task is first
+        await cp.stop_background_tasks()

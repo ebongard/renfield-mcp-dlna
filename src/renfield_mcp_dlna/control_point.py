@@ -27,6 +27,15 @@ from async_upnp_client.event_handler import UpnpEventHandler
 
 logger = logging.getLogger(__name__)
 
+# Coalesce a burst of SSDP NOTIFYs (devices emit several on boot) into one
+# discovery refresh, fired this long after the last change.
+_SSDP_REFRESH_DEBOUNCE = 3.0
+# How often the watchdog re-polls each active session's transport state. Keeps
+# status fresh on event-silent renderers and surfaces a device that vanished;
+# GENA subscription renewal itself is handled by async_upnp_client's
+# auto_resubscribe, so this stays a READ-ONLY poll (never touches the queue).
+_WATCHDOG_INTERVAL = 30.0
+
 
 def detect_local_ip() -> str:
     """Detect a local IP that can reach the LAN (for the UPnP callback URL).
@@ -64,6 +73,12 @@ class ControlPoint:
         # Per-renderer locks so two concurrent play requests on one renderer
         # don't race the stop-old/start-new session swap.
         self._udn_locks: dict[str, asyncio.Lock] = {}
+        # Passive SSDP listener + debounced "device set changed" refresh.
+        self._ssdp_listener = None
+        self._on_change = None
+        self._refresh_task: asyncio.Task | None = None
+        # Periodic read-only session state watchdog.
+        self._watchdog_task: asyncio.Task | None = None
 
     @property
     def started(self) -> bool:
@@ -102,6 +117,26 @@ class ControlPoint:
         self.event_handler = None
         self.factory = None
 
+    async def stop_background_tasks(self) -> None:
+        """Stop the SSDP listener, debounce timer, and watchdog (idempotent).
+
+        Separate from aclose() because the notify-server infra is torn down when
+        the last session leaves, whereas the listener/watchdog live for the whole
+        process and are stopped only at shutdown.
+        """
+        for task in (self._refresh_task, self._watchdog_task):
+            if task and not task.done():
+                task.cancel()
+        self._refresh_task = None
+        self._watchdog_task = None
+        if self._ssdp_listener is not None:
+            try:
+                await self._ssdp_listener.async_stop()
+            except Exception as e:  # noqa: BLE001 - shutdown is best-effort
+                logger.debug(f"SSDP listener stop failed: {e}")
+            self._ssdp_listener = None
+            logger.info("SSDP listener stopped")
+
     def lock_for(self, udn: str) -> asyncio.Lock:
         """A stable per-renderer lock (created on first use). Held around the
         session-swap critical section in play_tracks."""
@@ -110,6 +145,83 @@ class ControlPoint:
             lock = asyncio.Lock()
             self._udn_locks[udn] = lock
         return lock
+
+    # -- passive SSDP listener (live device cache) -------------------------
+
+    async def start_discovery_listener(self, on_change) -> None:
+        """Listen for SSDP alive/byebye and call `on_change` (an async no-arg
+        callable) when the device set changes, debounced. `on_change` typically
+        refreshes the discovery caches. Idempotent.
+
+        Intended for the long-lived streamable-http transport; stdio uses
+        on-demand search instead (a short-lived subprocess gains little from a
+        persistent multicast listener).
+        """
+        if self._ssdp_listener is not None:
+            return
+        from async_upnp_client.const import SsdpSource
+        from async_upnp_client.ssdp_listener import SsdpListener
+
+        self._on_change = on_change
+        # alive/byebye/changed all mean "the device set may have changed".
+        relevant = {
+            SsdpSource.ADVERTISEMENT_ALIVE,
+            SsdpSource.ADVERTISEMENT_BYEBYE,
+            SsdpSource.ADVERTISEMENT_UPDATE,
+            SsdpSource.SEARCH_ALIVE,
+            SsdpSource.SEARCH_CHANGED,
+        }
+
+        async def _callback(device, change, source) -> None:
+            try:
+                if source in relevant:
+                    self._schedule_refresh()
+            except Exception as e:  # noqa: BLE001 - never raise into the library
+                logger.debug(f"SSDP callback error: {e}")
+
+        self._ssdp_listener = SsdpListener(async_callback=_callback)
+        await self._ssdp_listener.async_start()
+        logger.info("SSDP listener started (live device cache)")
+
+    def _schedule_refresh(self) -> None:
+        """(Re)arm the debounce timer; the actual refresh fires once quiet."""
+        if self._refresh_task and not self._refresh_task.done():
+            self._refresh_task.cancel()
+        self._refresh_task = asyncio.ensure_future(self._debounced_refresh())
+
+    async def _debounced_refresh(self) -> None:
+        try:
+            await asyncio.sleep(_SSDP_REFRESH_DEBOUNCE)
+            if self._on_change is not None:
+                await self._on_change()
+        except asyncio.CancelledError:
+            pass  # superseded by a newer change
+        except Exception as e:  # noqa: BLE001 - refresh is best-effort
+            logger.debug(f"Discovery refresh failed: {e}")
+
+    # -- session watchdog (read-only state refresh) ------------------------
+
+    async def start_session_watchdog(self, interval: float = _WATCHDOG_INTERVAL) -> None:
+        """Periodically refresh each active session's transport state (read-only).
+        Idempotent. Safe: only calls refresh_state(), never queue operations."""
+        if self._watchdog_task is not None and not self._watchdog_task.done():
+            return
+        self._watchdog_task = asyncio.ensure_future(self._watchdog_loop(interval))
+
+    async def _watchdog_loop(self, interval: float) -> None:
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                for session in list(self.sessions.values()):
+                    refresh = getattr(session, "refresh_state", None)
+                    if refresh is None:
+                        continue
+                    try:
+                        await refresh()
+                    except Exception as e:  # noqa: BLE001 - per-session best-effort
+                        logger.debug(f"Watchdog refresh failed: {e}")
+        except asyncio.CancelledError:
+            pass
 
     # -- session registry --------------------------------------------------
 
