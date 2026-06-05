@@ -13,6 +13,7 @@ from renfield_mcp_dlna import discovery, mediaserver, queue_manager, server
 from renfield_mcp_dlna.backends import avtransport
 from renfield_mcp_dlna.backends.avtransport import AvTransportBackend
 from renfield_mcp_dlna.backends.openhome import OpenHomeBackend
+from renfield_mcp_dlna.backends.sonos import SonosBackend
 from renfield_mcp_dlna.control_point import ControlPoint
 from renfield_mcp_dlna.didl import build_didl_metadata
 from renfield_mcp_dlna.discovery import DlnaRenderer, DlnaServer
@@ -1921,3 +1922,82 @@ class TestQueueSessionOwnsQueue:
         s.backend.owns_queue = True
         s.backend.go_next = AsyncMock(return_value=False)
         assert await s.next() is None
+
+
+# ---------------------------------------------------------------------------
+# T11: SonosBackend (wraps soco) — optional dep, env-gated, provisional
+# ---------------------------------------------------------------------------
+
+class TestSonosBackend:
+    def test_owns_queue_and_supports_next(self):
+        b = SonosBackend(_make_renderer())
+        assert b.owns_queue is True
+        assert b.supports_next is True
+
+    def test_host_extracted_from_location(self):
+        b = SonosBackend(_make_renderer())  # location http://192.168.1.100:49152/...
+        assert b._host() == "192.168.1.100"
+
+    async def test_load_queue_clears_adds_and_plays(self):
+        b = SonosBackend(_make_renderer())
+        b._soco = MagicMock()
+        await b.load_queue([("u1", "A", "m"), ("u2", "B", "m")], start_index=0)
+        b._soco.clear_queue.assert_called_once()
+        assert b._soco.add_uri_to_queue.call_count == 2
+        b._soco.play_from_queue.assert_called_once_with(0)
+        assert b._queue_len == 2
+
+    async def test_go_next_then_previous(self):
+        b = SonosBackend(_make_renderer())
+        b._soco = MagicMock()
+        await b.load_queue([("u", "t", "m")] * 3)
+        assert await b.go_next() is True
+        assert b._current_index == 1
+        b._soco.next.assert_called_once()
+        assert await b.go_previous() is True
+        assert await b.go_previous() is False
+
+    async def test_volume_roundtrip(self):
+        b = SonosBackend(_make_renderer())
+        b._soco = MagicMock()
+        await b.set_volume(40)
+        assert b._soco.volume == 40
+        assert await b.get_volume() == 40
+
+    async def test_mute_roundtrip(self):
+        b = SonosBackend(_make_renderer())
+        b._soco = MagicMock()
+        await b.set_mute(True)
+        assert b._soco.mute is True
+        assert await b.get_mute() is True
+
+    async def test_play_uri_is_rejected(self):
+        b = SonosBackend(_make_renderer())
+        b._soco = MagicMock()
+        with pytest.raises(RuntimeError, match="uses load_queue"):
+            await b.play_uri("u", "t", "m")
+
+
+class TestSonosFactoryRouting:
+    def test_routes_to_sonos_when_env_enabled(self, monkeypatch):
+        monkeypatch.setenv("RENFIELD_SONOS", "1")
+        r = _make_renderer()
+        r.is_sonos = True
+        assert isinstance(queue_manager._make_backend(r), SonosBackend)
+
+    def test_defaults_to_avtransport_without_env(self, monkeypatch):
+        monkeypatch.delenv("RENFIELD_SONOS", raising=False)
+        r = _make_renderer()
+        r.is_sonos = True
+        assert isinstance(queue_manager._make_backend(r), AvTransportBackend)
+
+
+class TestSonosDetection:
+    async def test_manufacturer_sonos_sets_flag(self):
+        xml = _DESC_TMPL.format(name="Living Room", mfr="Sonos, Inc.",
+                                model="One", extra_service="")
+        r = await discovery._fetch_device_description(
+            _desc_session(xml), "http://1.2.3.4:1400/desc.xml"
+        )
+        assert r is not None
+        assert r.is_sonos is True

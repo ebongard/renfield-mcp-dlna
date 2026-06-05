@@ -8,10 +8,12 @@ device family. See base.PlaybackBackend.
 from .base import PlaybackBackend, TransportEvent
 from .avtransport import AvTransportBackend
 from .openhome import OpenHomeBackend
+from .sonos import SonosBackend
 
 __all__ = [
     "PlaybackBackend",
     "TransportEvent",
     "AvTransportBackend",
     "OpenHomeBackend",
+    "SonosBackend",
 ]

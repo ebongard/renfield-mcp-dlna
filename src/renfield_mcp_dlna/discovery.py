@@ -54,6 +54,7 @@ class DlnaRenderer:
     manufacturer: str = ""
     model_name: str = ""
     is_openhome: bool = False
+    is_sonos: bool = False
 
 
 _renderer_cache: list[DlnaRenderer] = []
@@ -271,6 +272,7 @@ async def _fetch_device_description(
         manufacturer=manufacturer,
         model_name=model_name,
         is_openhome=is_openhome,
+        is_sonos="sonos" in manufacturer.lower(),
     )
 
 

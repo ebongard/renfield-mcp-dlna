@@ -25,6 +25,11 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
 ]
+# Sonos support (provisional): wraps the soco library. Enable at runtime with
+# RENFIELD_SONOS=1.
+sonos = [
+    "soco>=0.30",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]

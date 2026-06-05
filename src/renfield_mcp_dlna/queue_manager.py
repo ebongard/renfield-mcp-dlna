@@ -29,7 +29,12 @@ import time
 from dataclasses import dataclass
 
 from . import metadata
-from .backends import AvTransportBackend, OpenHomeBackend, PlaybackBackend
+from .backends import (
+    AvTransportBackend,
+    OpenHomeBackend,
+    PlaybackBackend,
+    SonosBackend,
+)
 from .backends.base import TRANSPORT_DEAD, TRANSPORT_OK
 from .control_point import ControlPoint
 from .discovery import DlnaRenderer
@@ -70,6 +75,13 @@ def _make_backend(renderer: DlnaRenderer) -> PlaybackBackend:
     (renderer.is_openhome); until OpenHomeBackend lands (Phase 5) they still use
     AVTransport, which they also advertise.
     """
+    # SonosBackend (soco) is PROVISIONAL + needs the optional `soco` dep, so it's
+    # opt-in via RENFIELD_SONOS=1. Without it, generic AVTransport gives basic
+    # single-device control.
+    if renderer.is_sonos and os.getenv("RENFIELD_SONOS") == "1":
+        logger.info(f"[{renderer.name}] using SonosBackend (RENFIELD_SONOS=1)")
+        return SonosBackend(renderer)
+
     # OpenHomeBackend is implemented but PROVISIONAL (not yet validated on a real
     # Linn), so it's opt-in via RENFIELD_OPENHOME=1 — otherwise OpenHome renderers
     # use the AVTransport they also advertise, preserving today's behaviour.
