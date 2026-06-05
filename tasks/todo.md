@@ -9,7 +9,20 @@ Confirmed scope: renderers + MediaServers; device classes OpenHome (Linn), DLNA 
 (Samsung/LG/Sony), standard AVTransport (HiFiBerry/Kodi/VLC), Sonos; IPv4 multi-interface
 live-cache discovery.
 
-## Progress (branch `feat/upnp-control-point-phase1`, 129 tests green)
+## Progress (branch `feat/upnp-control-point-phase1`, 148 tests green)
+
+**Update 2:** also landed **T9 MediaServer** (list_servers/browse_server/search_server/
+play_from_server via DmsDevice — full control point), the **per-UDN play lock** (part of T12),
+and **defusedxml** hardening of all device-description XML parsing (LAN-spoofable input).
+README + deps updated. Remaining is hardware-gated: **T1** SSDP-listener discovery, **T4/T10**
+OpenHome (Linn), **T8** TV protocolInfo (Samsung), **T11** Sonos (+soco), **T12** GENA-renewal/
+NOTIFY watchdog (needs a long-lived real device + reboot to validate). **T7** metadata memoize is
+deferred because it depends on T8's negotiation. MediaServer/renderer *discovery over real SSDP*
+is unit-covered (parsing+wiring) but needs a LAN to validate end-to-end.
+
+---
+
+### Update 1 (129 tests)
 
 Landed and verified with the mock suite (real-device validation still pending where noted):
 
