@@ -521,6 +521,31 @@ async def play_from_server(
     }
 
 
+async def _refresh_discovery_caches() -> None:
+    """Force-refresh the renderer + server caches (called by the SSDP listener
+    when the device set changes)."""
+    await discovery.discover_renderers(force=True)
+    await discovery.discover_servers(force=True)
+
+
+async def _serve_streamable_http() -> None:
+    """Run the HTTP server with a live SSDP cache + session watchdog.
+
+    The long-lived service starts a passive SSDP listener (devices that join or
+    leave update the cache without a forced rescan) and a read-only session
+    watchdog. stdio doesn't get these — it's a short-lived subprocess that gains
+    little from a persistent multicast listener.
+    """
+    cp = queue_manager._default_control_point
+    await cp.start_discovery_listener(_refresh_discovery_caches)
+    await cp.start_session_watchdog()
+    try:
+        await mcp.run_streamable_http_async()
+    finally:
+        await cp.stop_background_tasks()
+        await cp.aclose()
+
+
 def main():
     """Entry point for console script and python -m.
 
@@ -536,7 +561,8 @@ def main():
         logger.info(
             f"Starting DLNA MCP server on {mcp.settings.host}:{mcp.settings.port} (streamable-http)"
         )
-        mcp.run(transport="streamable-http")
+        import asyncio
+        asyncio.run(_serve_streamable_http())
     else:
         mcp.run(transport="stdio")
 
