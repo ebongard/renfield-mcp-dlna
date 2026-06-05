@@ -176,3 +176,23 @@ class PlaybackBackend(ABC):
     async def set_play_mode(self, mode: str) -> None:
         """Set the play mode (one of valid_play_modes). Default: unsupported."""
         raise RuntimeError("Renderer does not support play modes")
+
+    # -- device-owned queue (owns_queue=True backends, e.g. OpenHome) -------
+    # For these the *device* holds the playlist, so QueueSession hands the whole
+    # queue over once and asks the device to advance, instead of pushing one
+    # CurrentURI at a time. AVTransport backends leave these unimplemented.
+
+    async def load_queue(
+        self, items: list[tuple[str, str, str]], start_index: int = 0
+    ) -> None:
+        """Load (url, title, metadata) tuples into the device playlist and start
+        playing from start_index. Only meaningful when owns_queue is True."""
+        raise NotImplementedError("backend does not own a device queue")
+
+    async def go_next(self) -> bool:
+        """Advance the device-side queue; return False if already at the end."""
+        raise NotImplementedError("backend does not own a device queue")
+
+    async def go_previous(self) -> bool:
+        """Step back the device-side queue; return False if already at the start."""
+        raise NotImplementedError("backend does not own a device queue")

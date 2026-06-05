@@ -7,5 +7,11 @@ device family. See base.PlaybackBackend.
 
 from .base import PlaybackBackend, TransportEvent
 from .avtransport import AvTransportBackend
+from .openhome import OpenHomeBackend
 
-__all__ = ["PlaybackBackend", "TransportEvent", "AvTransportBackend"]
+__all__ = [
+    "PlaybackBackend",
+    "TransportEvent",
+    "AvTransportBackend",
+    "OpenHomeBackend",
+]

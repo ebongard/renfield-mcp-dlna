@@ -12,6 +12,7 @@ from renfield_mcp_dlna import control_point as cp_module
 from renfield_mcp_dlna import discovery, mediaserver, queue_manager, server
 from renfield_mcp_dlna.backends import avtransport
 from renfield_mcp_dlna.backends.avtransport import AvTransportBackend
+from renfield_mcp_dlna.backends.openhome import OpenHomeBackend
 from renfield_mcp_dlna.control_point import ControlPoint
 from renfield_mcp_dlna.didl import build_didl_metadata
 from renfield_mcp_dlna.discovery import DlnaRenderer, DlnaServer
@@ -1768,3 +1769,155 @@ class TestMetadataMemoization:
             second = s._build_metadata(s.tracks[0])
             mb.assert_not_called()  # served from cache, no rebuild
         assert second == first
+
+
+# ---------------------------------------------------------------------------
+# T10: OpenHomeBackend (Linn / device-owned queue) — env-gated, provisional
+# ---------------------------------------------------------------------------
+
+_OH_PLAYLIST = "urn:av-openhome-org:service:Playlist:1"
+_OH_VOLUME = "urn:av-openhome-org:service:Volume:1"
+
+
+def _mock_openhome_device(insert_ids=(11, 12, 13), volume_max=100,
+                          cur_volume=50, cur_mute=False):
+    """A mock UpnpDevice exposing OpenHome Playlist + Volume services. Records
+    action calls in the returned `calls` dict keyed by action name."""
+    calls: dict = {}
+    ids = iter(insert_ids)
+
+    def _action(name):
+        act = MagicMock()
+
+        async def _call(**kw):
+            calls.setdefault(name, []).append(kw)
+            if name == "Insert":
+                return {"NewId": next(ids)}
+            if name == "Characteristics":
+                return {"VolumeMax": volume_max}
+            if name == "Volume":
+                return {"Value": cur_volume}
+            if name == "Mute":
+                return {"Value": cur_mute}
+            return {}
+
+        act.async_call = AsyncMock(side_effect=_call)
+        return act
+
+    pl = MagicMock()
+    pl.action.side_effect = _action
+    vol = MagicMock()
+    vol.action.side_effect = _action
+    device = MagicMock()
+    device.services = {_OH_PLAYLIST: pl, _OH_VOLUME: vol}
+    return device, calls
+
+
+class TestOpenHomeBackend:
+    def test_owns_queue_and_supports_next(self):
+        b = OpenHomeBackend(_make_renderer())
+        assert b.owns_queue is True
+        assert b.supports_next is True
+
+    async def test_load_queue_inserts_chained_and_plays(self):
+        b = OpenHomeBackend(_make_renderer())
+        b._device, calls = _mock_openhome_device(insert_ids=(11, 12))
+        await b.load_queue([("u1", "A", "m1"), ("u2", "B", "m2")], start_index=0)
+        assert len(calls["Insert"]) == 2
+        assert calls["Insert"][0]["AfterId"] == 0       # head
+        assert calls["Insert"][1]["AfterId"] == 11      # after the first NewId
+        assert calls["SeekId"][0]["Value"] == 11        # start at first track id
+        assert "Play" in calls
+        assert b._track_ids == [11, 12]
+        assert b.transport_state == "PLAYING"
+
+    async def test_go_next_then_previous(self):
+        b = OpenHomeBackend(_make_renderer())
+        b._device, calls = _mock_openhome_device(insert_ids=(11, 12, 13))
+        await b.load_queue([("u", "t", "m")] * 3)
+        assert await b.go_next() is True
+        assert b._current_index == 1
+        assert await b.go_previous() is True
+        assert b._current_index == 0
+        assert await b.go_previous() is False  # already at start
+
+    async def test_go_next_at_end_is_false(self):
+        b = OpenHomeBackend(_make_renderer())
+        b._device, _ = _mock_openhome_device(insert_ids=(11,))
+        await b.load_queue([("u", "t", "m")])
+        assert await b.go_next() is False
+
+    async def test_volume_uses_openhome_service(self):
+        b = OpenHomeBackend(_make_renderer())
+        b._device, calls = _mock_openhome_device(volume_max=100, cur_volume=50)
+        await b.set_volume(40)
+        assert calls["SetVolume"][0]["Value"] == 40
+        assert await b.get_volume() == 50
+
+    async def test_volume_scales_to_device_max(self):
+        b = OpenHomeBackend(_make_renderer())
+        b._device, calls = _mock_openhome_device(volume_max=80)
+        await b.set_volume(50)
+        assert calls["SetVolume"][0]["Value"] == 40  # 50% of 80
+
+    async def test_mute_via_openhome(self):
+        b = OpenHomeBackend(_make_renderer())
+        b._device, calls = _mock_openhome_device(cur_mute=True)
+        await b.set_mute(True)
+        assert calls["SetMute"][0]["Value"] is True
+        assert await b.get_mute() is True
+
+    async def test_play_uri_is_rejected(self):
+        b = OpenHomeBackend(_make_renderer())
+        b._device, _ = _mock_openhome_device()
+        with pytest.raises(RuntimeError, match="uses load_queue"):
+            await b.play_uri("u", "t", "m")
+
+
+class TestOpenHomeFactoryRouting:
+    def test_routes_to_openhome_when_env_enabled(self, monkeypatch):
+        monkeypatch.setenv("RENFIELD_OPENHOME", "1")
+        r = _make_renderer()
+        r.is_openhome = True
+        assert isinstance(queue_manager._make_backend(r), OpenHomeBackend)
+
+    def test_defaults_to_avtransport_without_env(self, monkeypatch):
+        monkeypatch.delenv("RENFIELD_OPENHOME", raising=False)
+        r = _make_renderer()
+        r.is_openhome = True
+        assert isinstance(queue_manager._make_backend(r), AvTransportBackend)
+
+
+class TestQueueSessionOwnsQueue:
+    async def test_start_hands_whole_queue_to_device(self):
+        s = QueueSession(_make_renderer(), _make_tracks(3))
+        s.backend = MagicMock()
+        s.backend.owns_queue = True
+        s.backend.connect = AsyncMock()
+        s.backend.load_queue = AsyncMock()
+        s.control_point.ensure_started = AsyncMock()
+        s.control_point.factory = MagicMock()
+        s.control_point.event_handler = MagicMock()
+        await s.start()
+        s.backend.load_queue.assert_awaited_once()
+        items = s.backend.load_queue.call_args.args[0]
+        assert len(items) == 3
+        assert items[0][0] == s.tracks[0].url
+
+    async def test_next_delegates_to_device_queue(self):
+        s = QueueSession(_make_renderer(), _make_tracks(3))
+        s.backend = MagicMock()
+        s.backend.owns_queue = True
+        s.backend.go_next = AsyncMock(return_value=True)
+        track = await s.next()
+        s.backend.go_next.assert_awaited_once()
+        assert s.current_index == 1
+        assert track is s.tracks[1]
+
+    async def test_next_stops_at_device_queue_end(self):
+        s = QueueSession(_make_renderer(), _make_tracks(2))
+        s.current_index = 1
+        s.backend = MagicMock()
+        s.backend.owns_queue = True
+        s.backend.go_next = AsyncMock(return_value=False)
+        assert await s.next() is None

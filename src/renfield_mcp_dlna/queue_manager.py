@@ -24,11 +24,12 @@ Auto-advance / gapless state machine (driven by _on_transport_event):
 
 import asyncio
 import logging
+import os
 import time
 from dataclasses import dataclass
 
 from . import metadata
-from .backends import AvTransportBackend, PlaybackBackend
+from .backends import AvTransportBackend, OpenHomeBackend, PlaybackBackend
 from .backends.base import TRANSPORT_DEAD, TRANSPORT_OK
 from .control_point import ControlPoint
 from .discovery import DlnaRenderer
@@ -69,10 +70,16 @@ def _make_backend(renderer: DlnaRenderer) -> PlaybackBackend:
     (renderer.is_openhome); until OpenHomeBackend lands (Phase 5) they still use
     AVTransport, which they also advertise.
     """
+    # OpenHomeBackend is implemented but PROVISIONAL (not yet validated on a real
+    # Linn), so it's opt-in via RENFIELD_OPENHOME=1 — otherwise OpenHome renderers
+    # use the AVTransport they also advertise, preserving today's behaviour.
     if renderer.is_openhome:
+        if os.getenv("RENFIELD_OPENHOME") == "1":
+            logger.info(f"[{renderer.name}] using OpenHomeBackend (RENFIELD_OPENHOME=1)")
+            return OpenHomeBackend(renderer)
         logger.debug(
-            f"[{renderer.name}] OpenHome renderer — using AVTransport until "
-            f"OpenHomeBackend lands (native Playlist queue pending)"
+            f"[{renderer.name}] OpenHome renderer — using AVTransport "
+            f"(set RENFIELD_OPENHOME=1 to use the native Playlist backend)"
         )
     return AvTransportBackend(renderer)
 
@@ -133,6 +140,17 @@ class QueueSession:
             factory=self.control_point.factory,
             event_handler=self.control_point.event_handler,
         )
+
+        # Device-owned queue (OpenHome): hand the whole queue over once; the
+        # device manages playback + gapless transitions itself.
+        if self.backend.owns_queue:
+            items = [(t.url, t.title, self._build_metadata(t)) for t in self.tracks]
+            await self.backend.load_queue(items, start_index=0)
+            logger.info(
+                f"[{self.renderer.name}] Loaded device queue: "
+                f"{len(self.tracks)} track(s)"
+            )
+            return
 
         track = self.tracks[0]
         await self.backend.play_uri(track.url, track.title, self._build_metadata(track))
@@ -290,6 +308,11 @@ class QueueSession:
         """Skip to next track immediately."""
         if self.current_index + 1 >= len(self.tracks):
             return None
+        if self.backend.owns_queue:
+            if not await self.backend.go_next():
+                return None
+            self.current_index += 1
+            return self.tracks[self.current_index]
         self.current_index += 1
         self._preloaded_index = None
         track = self.tracks[self.current_index]
@@ -305,6 +328,11 @@ class QueueSession:
         """Go to previous track."""
         if self.current_index <= 0:
             return None
+        if self.backend.owns_queue:
+            if not await self.backend.go_previous():
+                return None
+            self.current_index -= 1
+            return self.tracks[self.current_index]
         self.current_index -= 1
         self._preloaded_index = None
         track = self.tracks[self.current_index]
