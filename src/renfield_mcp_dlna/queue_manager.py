@@ -116,6 +116,9 @@ class QueueSession:
         # Source of truth for status() — never assume "playing" just because a
         # renderer is bound.
         self._transport_state: str | None = None
+        # Last RenderingControl Volume (0-100) seen via LAST_CHANGE events or
+        # written by set_volume — cached so get_volume avoids a SOAP round-trip.
+        self._volume: int | None = None
         # Guards the no-SetNext auto-advance against duplicate STOPPED events
         # firing a second _auto_advance before the first incremented the index.
         self._advancing = False
@@ -250,6 +253,15 @@ class QueueSession:
 
         transport_state = changes.get("TransportState")
         current_uri = changes.get("CurrentTrackURI")
+
+        # RenderingControl Volume rides on the same event stream; cache it so
+        # get_volume can answer without a SOAP round-trip.
+        volume = changes.get("Volume")
+        if volume is not None:
+            try:
+                self._volume = int(volume)
+            except (TypeError, ValueError):
+                pass
 
         # Did the renderer actually reach a playing state for this track? A
         # transient STOPPED/NO_MEDIA_PRESENT during the initial buffering window
@@ -419,6 +431,36 @@ class QueueSession:
         if self._dmr is None:
             raise RuntimeError("No active playback session")
         await self._dmr.async_set_volume_level(volume / 100.0)
+        # Reflect our own write in the cache so get_volume stays consistent
+        # without waiting for the renderer's echoed Volume event.
+        self._volume = volume
+
+    async def get_volume(self) -> int | None:
+        """Current volume (0-100), or None if the renderer can't report it.
+
+        Prefers the cached value maintained by _on_event / set_volume (no SOAP
+        round-trip). Falls back to a bounded async_update() read, mirroring
+        refresh_state()'s timeout handling.
+        """
+        if self._volume is not None:
+            return self._volume
+        if self._dmr is None:
+            return None
+        try:
+            await asyncio.wait_for(
+                self._dmr.async_update(), timeout=_TRANSPORT_POLL_TIMEOUT
+            )
+        except Exception:  # noqa: BLE001 - read is best-effort, mirror _query_transport_state
+            return None
+        level = self._dmr.volume_level
+        if level is None:
+            return None
+        vol = round(level * 100)
+        # A Volume event may have landed via _on_event while async_update() ran;
+        # that value is fresher than this poll, so don't clobber it.
+        if self._volume is None:
+            self._volume = vol
+        return vol
 
     async def _cleanup(self) -> None:
         """Remove session from registry, shutdown infra if last."""

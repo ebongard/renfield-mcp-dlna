@@ -251,6 +251,24 @@ async def set_volume(renderer_name: str, volume: int) -> dict:
         return {"success": False, "error": f"Failed to set volume: {e}"}
 
 
+@mcp.tool()
+async def get_volume(renderer_name: str) -> dict:
+    """Get current playback volume (0-100) on a DLNA renderer.
+
+    Returns volume=None if the renderer cannot report it.
+    """
+    renderer = await discovery.find_renderer(renderer_name)
+    if not renderer:
+        return {"success": False, "error": f"Renderer '{renderer_name}' not found"}
+
+    session = queue_manager.get_session(renderer.udn)
+    if not session:
+        return {"success": False, "error": f"No active playback on '{renderer.name}'"}
+
+    volume = await session.get_volume()
+    return {"success": True, "renderer": renderer.name, "volume": volume}
+
+
 def main():
     """Entry point for console script and python -m.
 
