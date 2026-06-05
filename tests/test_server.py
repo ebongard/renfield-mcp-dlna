@@ -9,13 +9,47 @@ import pytest
 from async_upnp_client.profiles.dlna import PlayMode
 
 from renfield_mcp_dlna import control_point as cp_module
-from renfield_mcp_dlna import discovery, queue_manager, server
+from renfield_mcp_dlna import discovery, mediaserver, queue_manager, server
 from renfield_mcp_dlna.backends import avtransport
 from renfield_mcp_dlna.backends.avtransport import AvTransportBackend
 from renfield_mcp_dlna.control_point import ControlPoint
 from renfield_mcp_dlna.didl import build_didl_metadata
-from renfield_mcp_dlna.discovery import DlnaRenderer
+from renfield_mcp_dlna.discovery import DlnaRenderer, DlnaServer
 from renfield_mcp_dlna.queue_manager import QueueSession, Track
+
+
+def _make_server(name: str = "Jellyfin", udn: str = "uuid:srv-1") -> DlnaServer:
+    return DlnaServer(
+        name=name,
+        udn=udn,
+        location="http://192.168.1.50:8096/desc.xml",
+        content_directory_control_url="http://192.168.1.50:8096/cd/control",
+        base_url="http://192.168.1.50:8096",
+        manufacturer="Jellyfin",
+        model_name="Jellyfin Server",
+    )
+
+
+def _didl_obj(obj_id, title, upnp_class, url=None, **extra):
+    """A stand-in for a didl_lite object as DmsDevice returns."""
+    o = MagicMock()
+    o.id = obj_id
+    o.title = title
+    o.upnp_class = upnp_class
+    o.resources = [MagicMock(uri=url)] if url else []
+    for k, v in extra.items():
+        setattr(o, k, v)
+    return o
+
+
+def _browse_result(objects, total=None):
+    from types import SimpleNamespace
+    return SimpleNamespace(
+        result=objects,
+        number_returned=len(objects),
+        total_matches=total if total is not None else len(objects),
+        update_id=1,
+    )
 
 
 def _connected_backend(renderer=None, dmr=None):
@@ -1456,3 +1490,181 @@ class TestSetPlayModeTool:
             result = await server.set_play_mode("HiFiBerry", "random")
             assert result.get("success") is False
             assert "Failed to set play mode" in result["error"]
+
+
+# ---------------------------------------------------------------------------
+# P4: MediaServer (ContentDirectory) browsing + play_from_server
+# ---------------------------------------------------------------------------
+
+class TestMediaServerParsing:
+    def test_item_with_resource_is_playable(self):
+        obj = _didl_obj("track-1", "Cold as Ice", "object.item.audioItem.musicTrack",
+                        url="http://srv/1.flac", artist="Foreigner", album="4")
+        d = mediaserver._object_to_dict(obj)
+        assert d["type"] == "item"
+        assert d["playable"] is True
+        assert d["url"] == "http://srv/1.flac"
+        assert d["media_type"] == "audio"
+        assert d["artist"] == "Foreigner"
+
+    def test_container_is_not_playable(self):
+        obj = _didl_obj("album-1", "Greatest Hits", "object.container.album.musicAlbum")
+        d = mediaserver._object_to_dict(obj)
+        assert d["type"] == "container"
+        assert d["playable"] is False
+        assert d["url"] == ""
+
+    def test_video_item_media_type(self):
+        obj = _didl_obj("v1", "Movie", "object.item.videoItem.movie", url="http://srv/m.mp4")
+        assert mediaserver._object_to_dict(obj)["media_type"] == "video"
+
+    def test_descriptor_without_class_is_skipped(self):
+        desc = MagicMock(spec=[])  # no upnp_class / id attrs
+        assert mediaserver._object_to_dict(desc) is None
+        objs = [desc, _didl_obj("i", "t", "object.item.audioItem", url="http://x/a")]
+        assert len(mediaserver._parse_objects(objs)) == 1
+
+
+class TestMediaServerBrowseSearch:
+    async def test_browse_returns_parsed_children(self, monkeypatch):
+        dms = MagicMock()
+        dms.async_browse_direct_children = AsyncMock(return_value=_browse_result([
+            _didl_obj("c1", "Albums", "object.container"),
+            _didl_obj("t1", "Song", "object.item.audioItem.musicTrack", url="http://srv/s.flac"),
+        ], total=2))
+        monkeypatch.setattr(mediaserver, "_make_dms", AsyncMock(return_value=dms))
+        result = await mediaserver.browse(_make_server(), MagicMock(), "0")
+        assert result["total"] == 2
+        assert result["items"][0]["type"] == "container"
+        assert result["items"][1]["playable"] is True
+        dms.async_browse_direct_children.assert_awaited_once()
+
+    async def test_search_requires_capability(self, monkeypatch):
+        dms = MagicMock()
+        dms.has_search_directory = False
+        monkeypatch.setattr(mediaserver, "_make_dms", AsyncMock(return_value=dms))
+        with pytest.raises(RuntimeError, match="does not support search"):
+            await mediaserver.search(_make_server(), MagicMock(), "ice")
+
+    async def test_search_builds_title_criteria(self, monkeypatch):
+        dms = MagicMock()
+        dms.has_search_directory = True
+        dms.async_search_directory = AsyncMock(return_value=_browse_result([
+            _didl_obj("t1", "Cold as Ice", "object.item.audioItem.musicTrack", url="http://srv/s.flac"),
+        ]))
+        monkeypatch.setattr(mediaserver, "_make_dms", AsyncMock(return_value=dms))
+        result = await mediaserver.search(_make_server(), MagicMock(), 'ice"x')
+        assert result["returned"] == 1
+        criteria = dms.async_search_directory.call_args.args[1]
+        assert 'dc:title contains' in criteria
+        assert '\\"' in criteria  # embedded quote escaped
+
+    async def test_resolve_playables_container_path(self, monkeypatch):
+        dms = MagicMock()
+        dms.async_browse_direct_children = AsyncMock(return_value=_browse_result([
+            _didl_obj("t1", "A", "object.item.audioItem.musicTrack", url="http://srv/a.flac"),
+            _didl_obj("t2", "B", "object.item.audioItem.musicTrack", url="http://srv/b.flac"),
+            _didl_obj("c", "sub", "object.container"),  # non-playable, excluded
+        ]))
+        monkeypatch.setattr(mediaserver, "_make_dms", AsyncMock(return_value=dms))
+        playables = await mediaserver.resolve_playables(_make_server(), MagicMock(), "album-1")
+        assert [p["url"] for p in playables] == ["http://srv/a.flac", "http://srv/b.flac"]
+
+    async def test_resolve_playables_single_item_fallback(self, monkeypatch):
+        dms = MagicMock()
+        dms.async_browse_direct_children = AsyncMock(return_value=_browse_result([]))  # no children
+        dms.async_browse_metadata = AsyncMock(return_value=_browse_result([
+            _didl_obj("t1", "Solo", "object.item.audioItem.musicTrack", url="http://srv/solo.flac"),
+        ]))
+        monkeypatch.setattr(mediaserver, "_make_dms", AsyncMock(return_value=dms))
+        playables = await mediaserver.resolve_playables(_make_server(), MagicMock(), "t1")
+        assert len(playables) == 1
+        assert playables[0]["url"] == "http://srv/solo.flac"
+        dms.async_browse_metadata.assert_awaited_once()
+
+
+class TestMediaServerTools:
+    async def test_list_servers(self):
+        servers = [_make_server(name="Jellyfin"), _make_server(name="MinimServer", udn="uuid:m")]
+        with patch.object(discovery, "discover_servers", new_callable=AsyncMock, return_value=servers):
+            result = await server.list_servers()
+            assert result["total"] == 2
+            assert result["servers"][0]["name"] == "Jellyfin"
+
+    async def test_browse_server_success(self):
+        with (
+            patch.object(discovery, "find_server", new_callable=AsyncMock, return_value=_make_server()),
+            patch.object(server, "_content_directory_factory", new_callable=AsyncMock, return_value=MagicMock()),
+            patch.object(mediaserver, "browse", new_callable=AsyncMock, return_value={"items": [], "total": 0}),
+        ):
+            result = await server.browse_server("Jellyfin", "0")
+            assert result.get("success") is True
+            assert result["total"] == 0
+
+    async def test_browse_server_not_found(self):
+        with patch.object(discovery, "find_server", new_callable=AsyncMock, return_value=None):
+            result = await server.browse_server("Nope")
+            assert result.get("success") is False
+            assert "not found" in result["error"]
+
+    async def test_search_server_failure_surfaced(self):
+        with (
+            patch.object(discovery, "find_server", new_callable=AsyncMock, return_value=_make_server()),
+            patch.object(server, "_content_directory_factory", new_callable=AsyncMock, return_value=MagicMock()),
+            patch.object(mediaserver, "search", new_callable=AsyncMock, side_effect=RuntimeError("does not support search")),
+        ):
+            result = await server.search_server("Jellyfin", "ice")
+            assert result.get("success") is False
+            assert "Search failed" in result["error"]
+
+    async def test_play_from_server_wires_resolved_tracks(self):
+        playables = [
+            {"url": "http://srv/a.flac", "title": "A", "artist": "X", "album": "Y", "media_type": "audio"},
+            {"url": "http://srv/b.flac", "title": "B", "artist": "X", "album": "Y", "media_type": "audio"},
+        ]
+        with (
+            patch.object(discovery, "find_server", new_callable=AsyncMock, return_value=_make_server()),
+            patch.object(discovery, "find_renderer", new_callable=AsyncMock, return_value=_make_renderer()),
+            patch.object(server, "_content_directory_factory", new_callable=AsyncMock, return_value=MagicMock()),
+            patch.object(mediaserver, "resolve_playables", new_callable=AsyncMock, return_value=playables),
+            patch.object(queue_manager, "play_tracks", new_callable=AsyncMock) as mock_play,
+        ):
+            result = await server.play_from_server("Jellyfin", "album-1", "HiFiBerry")
+            assert result.get("success") is True
+            assert result["total_tracks"] == 2
+            assert result["now_playing"]["title"] == "A"
+            tracks_arg = mock_play.call_args.args[1]
+            assert [t.url for t in tracks_arg] == ["http://srv/a.flac", "http://srv/b.flac"]
+
+    async def test_play_from_server_no_playables(self):
+        with (
+            patch.object(discovery, "find_server", new_callable=AsyncMock, return_value=_make_server()),
+            patch.object(discovery, "find_renderer", new_callable=AsyncMock, return_value=_make_renderer()),
+            patch.object(server, "_content_directory_factory", new_callable=AsyncMock, return_value=MagicMock()),
+            patch.object(mediaserver, "resolve_playables", new_callable=AsyncMock, return_value=[]),
+        ):
+            result = await server.play_from_server("Jellyfin", "empty", "HiFiBerry")
+            assert result.get("success") is False
+            assert "No playable items" in result["error"]
+
+
+class TestServerDescriptionParsing:
+    async def test_parses_content_directory_server(self):
+        xml = """<?xml version="1.0"?>
+<root xmlns="urn:schemas-upnp-org:device-1-0"><device>
+  <friendlyName>Jellyfin</friendlyName><manufacturer>Jellyfin</manufacturer>
+  <modelName>10.x</modelName><UDN>uuid:srv-9</UDN>
+  <serviceList><service>
+    <serviceType>urn:schemas-upnp-org:service:ContentDirectory:1</serviceType>
+    <controlURL>/cd/control</controlURL>
+  </service></serviceList>
+</device></root>"""
+        r = await discovery._fetch_server_description(_desc_session(xml), "http://1.2.3.4:8096/d.xml")
+        assert r is not None
+        assert r.name == "Jellyfin"
+        assert r.content_directory_control_url == "http://1.2.3.4:8096/cd/control"
+
+    async def test_renderer_without_content_directory_is_not_a_server(self):
+        xml = _DESC_TMPL.format(name="Speaker", mfr="HiFiBerry", model="OS", extra_service="")
+        r = await discovery._fetch_server_description(_desc_session(xml), "http://1.2.3.4:9999/d.xml")
+        assert r is None

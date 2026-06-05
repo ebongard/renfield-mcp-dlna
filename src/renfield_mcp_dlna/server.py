@@ -7,7 +7,7 @@ import sys
 
 from mcp.server.fastmcp import FastMCP
 
-from . import discovery, queue_manager
+from . import discovery, mediaserver, queue_manager
 from .queue_manager import Track
 
 # Logging to stderr (stdout is reserved for MCP stdio protocol)
@@ -61,6 +61,22 @@ async def _resolve_session(renderer_name: str):
     if not session:
         raise ToolError(f"No active playback on '{renderer.name}'")
     return renderer, session
+
+
+async def _resolve_server(server_name: str):
+    """Find a MediaServer by (partial) name or raise ToolError."""
+    server = await discovery.find_server(server_name)
+    if not server:
+        raise ToolError(f"Server '{server_name}' not found")
+    return server
+
+
+async def _content_directory_factory():
+    """The shared UPnP factory (used to build DmsDevices), ensuring the control
+    point's infra is started first."""
+    cp = queue_manager._default_control_point
+    await cp.ensure_started()
+    return cp.factory
 
 
 @mcp.tool()
@@ -375,6 +391,132 @@ async def set_mute(renderer_name: str, mute: bool) -> dict:
         return {"success": True, "renderer": renderer.name, "muted": mute}
     except Exception as e:
         return _error(f"Failed to set mute: {e}")
+
+
+# ---------------------------------------------------------------------------
+# MediaServer (ContentDirectory) tools — browse a library and play from it
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+async def list_servers(force_refresh: bool = False) -> dict:
+    """Discover DLNA MediaServers (content libraries) on the network.
+
+    Args:
+        force_refresh: If true, bypass the 5-minute cache and rescan.
+    """
+    servers = await discovery.discover_servers(force=force_refresh)
+    items = [
+        {"name": s.name, "manufacturer": s.manufacturer, "model": s.model_name}
+        for s in servers
+    ]
+    return {"total": len(items), "servers": items}
+
+
+@mcp.tool()
+async def browse_server(
+    server_name: str, object_id: str = "0", limit: int = 200, offset: int = 0
+) -> dict:
+    """Browse a MediaServer's library (direct children of a container).
+
+    Args:
+        server_name: Name (or partial name) of the MediaServer.
+        object_id: Container to list ("0" is the root). Use ids from a prior
+            browse/search to drill into folders/albums.
+        limit: Max items to return (pagination cap).
+        offset: Starting index for pagination.
+    """
+    try:
+        server = await _resolve_server(server_name)
+    except ToolError as e:
+        return _error(str(e))
+    try:
+        factory = await _content_directory_factory()
+        result = await mediaserver.browse(server, factory, object_id, limit, offset)
+        return {"success": True, **result}
+    except Exception as e:
+        return _error(f"Browse failed: {e}")
+
+
+@mcp.tool()
+async def search_server(server_name: str, query: str, limit: int = 200) -> dict:
+    """Search a MediaServer's library by title.
+
+    Args:
+        server_name: Name (or partial name) of the MediaServer.
+        query: Text to match against item titles.
+        limit: Max items to return.
+    """
+    try:
+        server = await _resolve_server(server_name)
+    except ToolError as e:
+        return _error(str(e))
+    try:
+        factory = await _content_directory_factory()
+        result = await mediaserver.search(server, factory, query, limit=limit)
+        return {"success": True, **result}
+    except Exception as e:
+        return _error(f"Search failed: {e}")
+
+
+@mcp.tool()
+async def play_from_server(
+    server_name: str, object_id: str, renderer_name: str
+) -> dict:
+    """Play a library object (album/playlist/folder/track) on a renderer.
+
+    Resolves the object's playable items on the MediaServer, then plays them as
+    a gapless queue on the renderer — no content URLs needed from the caller.
+
+    Args:
+        server_name: Name (or partial name) of the MediaServer holding the item.
+        object_id: The container or item id to play (from browse/search).
+        renderer_name: Name (or partial name) of the DLNA renderer to play on.
+    """
+    try:
+        server = await _resolve_server(server_name)
+        renderer = await _resolve_renderer(renderer_name)
+    except ToolError as e:
+        return _error(str(e))
+
+    try:
+        factory = await _content_directory_factory()
+        playables = await mediaserver.resolve_playables(server, factory, object_id)
+    except Exception as e:
+        return _error(f"Could not resolve items from server: {e}")
+
+    if not playables:
+        return _error(f"No playable items found for object '{object_id}'")
+
+    tracks = [
+        Track(
+            url=p["url"],
+            title=p["title"],
+            artist=p["artist"],
+            album=p["album"],
+            media_type=p["media_type"],
+        )
+        for p in playables
+    ]
+
+    try:
+        await queue_manager.play_tracks(renderer, tracks)
+    except Exception as e:
+        logger.error(f"play_from_server failed on {renderer.name}: {e}", exc_info=True)
+        return _error(f"Playback failed: {e}")
+
+    return {
+        "success": True,
+        "server": server.name,
+        "renderer": renderer.name,
+        "total_tracks": len(tracks),
+        "now_playing": {
+            "track": 1,
+            "title": tracks[0].title,
+            "artist": tracks[0].artist,
+            "album": tracks[0].album,
+        },
+    }
 
 
 def main():

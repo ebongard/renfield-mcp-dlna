@@ -6,9 +6,14 @@ import socket
 import struct
 import time
 from dataclasses import dataclass
-from xml.etree import ElementTree as ET
 
 import aiohttp
+
+# defusedxml: device descriptions come from LAN devices and UPnP is spoofable,
+# so parse untrusted XML with the hardened parser (blocks billion-laughs entity
+# expansion / XXE that stdlib ElementTree allows).
+import defusedxml.ElementTree as ET  # noqa: N817
+from defusedxml.common import DefusedXmlException
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +58,25 @@ class DlnaRenderer:
 
 _renderer_cache: list[DlnaRenderer] = []
 _cache_time: float = 0
+
+_CONTENT_DIRECTORY_PREFIX = "urn:schemas-upnp-org:service:ContentDirectory:"
+
+
+@dataclass
+class DlnaServer:
+    """Discovered DLNA MediaServer (exposes a ContentDirectory to browse)."""
+
+    name: str
+    udn: str
+    location: str
+    content_directory_control_url: str
+    base_url: str = ""
+    manufacturer: str = ""
+    model_name: str = ""
+
+
+_server_cache: list[DlnaServer] = []
+_server_cache_time: float = 0
 
 
 def _build_msearch(search_target: str = _SEARCH_TARGET) -> bytes:
@@ -181,7 +205,7 @@ async def _fetch_device_description(
 
     try:
         root = ET.fromstring(xml_text)
-    except ET.ParseError:
+    except (ET.ParseError, DefusedXmlException):
         return None
 
     device = root.find(f"{{{_NS_DEVICE}}}device")
@@ -268,7 +292,7 @@ async def _check_set_next_support(
 
     try:
         root = ET.fromstring(xml_text)
-    except ET.ParseError:
+    except (ET.ParseError, DefusedXmlException):
         return False
 
     # Search for action name in SCPD
@@ -316,17 +340,113 @@ async def discover_renderers(force: bool = False) -> list[DlnaRenderer]:
 
 async def find_renderer(name: str) -> DlnaRenderer | None:
     """Find a renderer by case-insensitive substring match on friendly name."""
-    renderers = await discover_renderers()
+    return _match_by_name(await discover_renderers(), name)
+
+
+# ---------------------------------------------------------------------------
+# MediaServer (ContentDirectory) discovery
+# ---------------------------------------------------------------------------
+
+
+async def _fetch_server_description(
+    session: aiohttp.ClientSession, location: str
+) -> DlnaServer | None:
+    """Fetch a device description and parse it as a MediaServer (one that
+    exposes a ContentDirectory service). Returns None for non-servers."""
+    try:
+        async with session.get(location, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+            if resp.status != 200:
+                return None
+            xml_text = await resp.text()
+    except Exception as e:
+        logger.debug(f"Failed to fetch {location}: {e}")
+        return None
+
+    try:
+        root = ET.fromstring(xml_text)
+    except (ET.ParseError, DefusedXmlException):
+        return None
+
+    device = root.find(f"{{{_NS_DEVICE}}}device")
+    if device is None:
+        return None
+
+    udn = device.findtext(f"{{{_NS_DEVICE}}}UDN", "")
+    if not udn:
+        return None
+    friendly_name = device.findtext(f"{{{_NS_DEVICE}}}friendlyName", "")
+    manufacturer = device.findtext(f"{{{_NS_DEVICE}}}manufacturer", "")
+    model_name = device.findtext(f"{{{_NS_DEVICE}}}modelName", "")
+    base_url = _base_url_from_location(location)
+
+    service_list = device.find(f"{{{_NS_DEVICE}}}serviceList")
+    if service_list is None:
+        return None
+
+    cd_control_url = ""
+    for service in service_list.findall(f"{{{_NS_DEVICE}}}service"):
+        service_type = service.findtext(f"{{{_NS_DEVICE}}}serviceType", "")
+        if service_type.startswith(_CONTENT_DIRECTORY_PREFIX):
+            cd_control_url = service.findtext(f"{{{_NS_DEVICE}}}controlURL", "") or ""
+            break
+
+    if not cd_control_url:
+        return None  # not a MediaServer
+    if not cd_control_url.startswith("http"):
+        cd_control_url = base_url + cd_control_url
+
+    return DlnaServer(
+        name=friendly_name,
+        udn=udn,
+        location=location,
+        content_directory_control_url=cd_control_url,
+        base_url=base_url,
+        manufacturer=manufacturer,
+        model_name=model_name,
+    )
+
+
+async def discover_servers(force: bool = False) -> list[DlnaServer]:
+    """Discover DLNA MediaServers on the network (5-minute cache)."""
+    global _server_cache, _server_cache_time
+
+    if not force and _server_cache and (time.time() - _server_cache_time) < CACHE_TTL:
+        return _server_cache
+
+    logger.info("Starting SSDP discovery for DLNA servers...")
+    locations = await _ssdp_search()
+
+    servers: list[DlnaServer] = []
+    async with aiohttp.ClientSession() as session:
+        tasks = [_fetch_server_description(session, loc) for loc in locations]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for result in results:
+            if isinstance(result, DlnaServer):
+                servers.append(result)
+            elif isinstance(result, Exception):
+                logger.debug(f"Server description fetch failed: {result}")
+
+    _server_cache = servers
+    _server_cache_time = time.time()
+    logger.info(
+        f"Discovered {len(servers)} server(s): "
+        + ", ".join(s.name for s in servers)
+    )
+    return servers
+
+
+async def find_server(name: str) -> DlnaServer | None:
+    """Find a MediaServer by case-insensitive substring match on friendly name."""
+    return _match_by_name(await discover_servers(), name)
+
+
+def _match_by_name(devices: list, name: str):
+    """Exact (case-insensitive) match first, then substring, on .name."""
     name_lower = name.lower()
-
-    # Exact match first
-    for r in renderers:
-        if r.name.lower() == name_lower:
-            return r
-
-    # Substring match
-    for r in renderers:
-        if name_lower in r.name.lower():
-            return r
-
+    for d in devices:
+        if d.name.lower() == name_lower:
+            return d
+    for d in devices:
+        if name_lower in d.name.lower():
+            return d
     return None
