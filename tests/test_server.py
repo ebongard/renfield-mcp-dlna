@@ -7,9 +7,19 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from renfield_mcp_dlna import discovery, queue_manager, server
+from renfield_mcp_dlna.backends import avtransport
+from renfield_mcp_dlna.backends.avtransport import AvTransportBackend
 from renfield_mcp_dlna.didl import build_didl_metadata
 from renfield_mcp_dlna.discovery import DlnaRenderer
 from renfield_mcp_dlna.queue_manager import QueueSession, Track
+
+
+def _connected_backend(renderer=None, dmr=None):
+    """An AvTransportBackend wired to a mock _dmr (post-refactor device I/O
+    lives on the backend, not the session)."""
+    backend = AvTransportBackend(renderer or _make_renderer())
+    backend._dmr = dmr if dmr is not None else MagicMock()
+    return backend
 
 
 # ---------------------------------------------------------------------------
@@ -633,13 +643,13 @@ class TestQueueSessionStatus:
 
     def _bound(self, transport_state):
         s = QueueSession(_make_renderer(), _make_tracks(1))
-        s._dmr = MagicMock()  # bound to a renderer
-        s._transport_state = transport_state
+        s.backend._dmr = MagicMock()  # backend bound to a renderer
+        s.backend._transport_state = transport_state
         return s
 
     def test_stopped_when_unbound(self):
         s = QueueSession(_make_renderer(), _make_tracks(1))
-        assert s._dmr is None
+        assert s.backend.connected is False
         assert s.status()["state"] == "stopped"
 
     def test_bound_without_event_is_not_playing(self):
@@ -660,18 +670,18 @@ class TestConfirmPlaybackStarted:
 
     async def test_returns_when_playing(self):
         s = QueueSession(_make_renderer(), _make_tracks(1))
-        s._transport_state = "PLAYING"
+        s.backend._transport_state = "PLAYING"
         await s._confirm_playback_started("Track 1")  # no raise
 
     async def test_raises_when_stream_unreachable(self):
         s = QueueSession(_make_renderer(), _make_tracks(1))
-        s._transport_state = "NO_MEDIA_PRESENT"
+        s.backend._transport_state = "NO_MEDIA_PRESENT"
         with pytest.raises(RuntimeError, match="did not start playback"):
             await s._confirm_playback_started("Track 1")
 
     async def test_raises_on_stopped(self):
         s = QueueSession(_make_renderer(), _make_tracks(1))
-        s._transport_state = "STOPPED"
+        s.backend._transport_state = "STOPPED"
         with pytest.raises(RuntimeError, match="did not start playback"):
             await s._confirm_playback_started("Track 1")
 
@@ -679,23 +689,23 @@ class TestConfirmPlaybackStarted:
         # A renderer that simply hasn't emitted an event yet must not be failed.
         monkeypatch.setattr(queue_manager, "_PLAYBACK_CONFIRM_TIMEOUT", 0.0)
         s = QueueSession(_make_renderer(), _make_tracks(1))
-        s._transport_state = None
+        s.backend._transport_state = None
         await s._confirm_playback_started("Track 1")  # warns, no raise
 
     async def test_confirms_via_poll_when_no_event(self):
         # Event-silent renderer (HiFiBerryOS): no LAST_CHANGE event ever fires,
         # but an active GetTransportInfo poll reports PLAYING → confirmed.
         s = QueueSession(_make_renderer(), _make_tracks(1))
-        s._transport_state = None
-        s._query_transport_state = AsyncMock(return_value="PLAYING")
+        s.backend._transport_state = None
+        s.backend.query_transport_state = AsyncMock(return_value="PLAYING")
         await s._confirm_playback_started("Track 1")  # no raise
-        s._query_transport_state.assert_awaited()
+        s.backend.query_transport_state.assert_awaited()
 
     async def test_poll_detects_dead_renderer(self):
         # Poll reveals the renderer never started (404 stream → STOPPED).
         s = QueueSession(_make_renderer(), _make_tracks(1))
-        s._transport_state = None
-        s._query_transport_state = AsyncMock(return_value="STOPPED")
+        s.backend._transport_state = None
+        s.backend.query_transport_state = AsyncMock(return_value="STOPPED")
         with pytest.raises(RuntimeError, match="did not start playback"):
             await s._confirm_playback_started("Track 1")
 
@@ -706,12 +716,11 @@ class TestQueryTransportState:
     renderers."""
 
     async def test_query_returns_normalized_state(self):
-        s = QueueSession(_make_renderer(), _make_tracks(1))
         dmr = MagicMock()
         dmr.async_update = AsyncMock()
         dmr.transport_state = MagicMock(value="PLAYING")
-        s._dmr = dmr
-        assert await s._query_transport_state() == "PLAYING"
+        b = _connected_backend(dmr=dmr)
+        assert await b.query_transport_state() == "PLAYING"
         dmr.async_update.assert_awaited()
 
     async def test_query_normalizes_real_transport_state_enum(self):
@@ -720,69 +729,65 @@ class TestQueryTransportState:
         # This guards against a regression to str(ts).upper().
         from async_upnp_client.profiles.dlna import TransportState
 
-        s = QueueSession(_make_renderer(), _make_tracks(1))
         dmr = MagicMock()
         dmr.async_update = AsyncMock()
         dmr.transport_state = TransportState.PLAYING
-        s._dmr = dmr
-        assert await s._query_transport_state() == "PLAYING"
+        b = _connected_backend(dmr=dmr)
+        assert await b.query_transport_state() == "PLAYING"
 
     async def test_query_bounded_by_timeout(self, monkeypatch):
         # A hung renderer must not block get_status: async_update is wrapped in
         # asyncio.wait_for. With no known transport_state, the poll returns None
         # within budget rather than waiting out the hang.
-        monkeypatch.setattr(queue_manager, "_TRANSPORT_POLL_TIMEOUT", 0.01)
+        monkeypatch.setattr(avtransport, "_TRANSPORT_POLL_TIMEOUT", 0.01)
 
         async def _hang():
             await asyncio.sleep(1.0)
 
-        s = QueueSession(_make_renderer(), _make_tracks(1))
         dmr = MagicMock()
         dmr.async_update = _hang
         dmr.transport_state = None
-        s._dmr = dmr
-        assert await s._query_transport_state() is None
+        b = _connected_backend(dmr=dmr)
+        assert await b.query_transport_state() is None
 
     async def test_query_returns_none_when_unbound(self):
-        s = QueueSession(_make_renderer(), _make_tracks(1))
-        assert s._dmr is None
-        assert await s._query_transport_state() is None
+        b = AvTransportBackend(_make_renderer())
+        assert b.connected is False
+        assert await b.query_transport_state() is None
 
     async def test_query_returns_none_on_error_without_known_state(self):
-        s = QueueSession(_make_renderer(), _make_tracks(1))
         dmr = MagicMock()
         dmr.async_update = AsyncMock(side_effect=RuntimeError("upnp timeout"))
         dmr.transport_state = None
-        s._dmr = dmr
-        assert await s._query_transport_state() is None
+        b = _connected_backend(dmr=dmr)
+        assert await b.query_transport_state() is None
 
     async def test_query_falls_back_to_subscription_state_on_error(self):
         # Even if the active refresh raises, the lib keeps transport_state fresh
         # from the event subscription — report it instead of blanking to None.
         from async_upnp_client.profiles.dlna import TransportState
 
-        s = QueueSession(_make_renderer(), _make_tracks(1))
         dmr = MagicMock()
         dmr.async_update = AsyncMock(side_effect=RuntimeError("upnp timeout"))
         dmr.transport_state = TransportState.PLAYING
-        s._dmr = dmr
-        assert await s._query_transport_state() == "PLAYING"
+        b = _connected_backend(dmr=dmr)
+        assert await b.query_transport_state() == "PLAYING"
 
     async def test_refresh_state_updates_status(self):
         s = QueueSession(_make_renderer(), _make_tracks(1))
-        s._dmr = MagicMock()
-        s._query_transport_state = AsyncMock(return_value="PLAYING")
+        s.backend._dmr = MagicMock()
+        s.backend.query_transport_state = AsyncMock(return_value="PLAYING")
         await s.refresh_state()
-        assert s._transport_state == "PLAYING"
+        assert s.backend.transport_state == "PLAYING"
         assert s.status()["state"] == "playing"
 
     async def test_refresh_state_keeps_last_known_on_failed_poll(self):
         s = QueueSession(_make_renderer(), _make_tracks(1))
-        s._dmr = MagicMock()
-        s._transport_state = "PLAYING"
-        s._query_transport_state = AsyncMock(return_value=None)
+        s.backend._dmr = MagicMock()
+        s.backend._transport_state = "PLAYING"
+        s.backend.query_transport_state = AsyncMock(return_value=None)
         await s.refresh_state()
-        assert s._transport_state == "PLAYING"  # untouched
+        assert s.backend.transport_state == "PLAYING"  # untouched
 
 
 class _SV:
@@ -801,29 +806,29 @@ class TestOnEvent:
 
     def test_list_of_state_variables_sets_transport_state(self):
         s = QueueSession(_make_renderer(), _make_tracks(1))
-        s._dmr = MagicMock()
-        s._on_event(MagicMock(), [_SV("TransportState", "PLAYING"), _SV("TransportStatus", "OK")])
-        assert s._transport_state == "PLAYING"
+        s.backend._dmr = MagicMock()
+        s.backend._handle_raw_event(
+            MagicMock(), [_SV("TransportState", "PLAYING"), _SV("TransportStatus", "OK")]
+        )
+        assert s.backend.transport_state == "PLAYING"
         assert s.status()["state"] == "playing"
 
     def test_dict_shape_tolerated(self):
-        s = QueueSession(_make_renderer(), _make_tracks(1))
-        s._dmr = MagicMock()
-        s._on_event(MagicMock(), {"TransportState": "PAUSED_PLAYBACK"})
-        assert s._transport_state == "PAUSED_PLAYBACK"
+        b = _connected_backend()
+        b._handle_raw_event(MagicMock(), {"TransportState": "PAUSED_PLAYBACK"})
+        assert b.transport_state == "PAUSED_PLAYBACK"
 
     def test_empty_event_is_noop(self):
-        s = QueueSession(_make_renderer(), _make_tracks(1))
-        s._on_event(MagicMock(), [])  # must not raise
-        s._on_event(MagicMock(), None)
-        assert s._transport_state is None
+        b = AvTransportBackend(_make_renderer())
+        b._handle_raw_event(MagicMock(), [])  # must not raise
+        b._handle_raw_event(MagicMock(), None)
+        assert b.transport_state is None
 
     def test_list_without_transport_state_leaves_state(self):
-        s = QueueSession(_make_renderer(), _make_tracks(1))
-        s._dmr = MagicMock()
-        s._transport_state = "PLAYING"
-        s._on_event(MagicMock(), [_SV("Volume", 28), _SV("Mute", False)])
-        assert s._transport_state == "PLAYING"  # untouched by unrelated vars
+        b = _connected_backend()
+        b._transport_state = "PLAYING"
+        b._handle_raw_event(MagicMock(), [_SV("Volume", 28), _SV("Mute", False)])
+        assert b.transport_state == "PLAYING"  # untouched by unrelated vars
 
 
 class TestVolumeCache:
@@ -832,85 +837,85 @@ class TestVolumeCache:
     empty."""
 
     def test_on_event_caches_volume(self):
-        s = QueueSession(_make_renderer(), _make_tracks(1))
-        s._dmr, _ = _mock_dmr_with_rc(scale_max=100)
-        s._on_event(MagicMock(), [_SV("Volume", 28)])
-        assert s._volume == 28
+        b = AvTransportBackend(_make_renderer())
+        b._dmr, _ = _mock_dmr_with_rc(scale_max=100)
+        b._handle_raw_event(MagicMock(), [_SV("Volume", 28)])
+        assert b._volume == 28
 
     def test_on_event_bad_volume_ignored(self):
-        s = QueueSession(_make_renderer(), _make_tracks(1))
-        s._dmr, _ = _mock_dmr_with_rc()
-        s._on_event(MagicMock(), [_SV("Volume", "not-a-number")])
-        assert s._volume is None
+        b = AvTransportBackend(_make_renderer())
+        b._dmr, _ = _mock_dmr_with_rc()
+        b._handle_raw_event(MagicMock(), [_SV("Volume", "not-a-number")])
+        assert b._volume is None
 
     async def test_on_event_volume_normalized_to_percent_on_scaled_renderer(self):
         """A Volume event on a 0-255 renderer must cache/return percent (50),
         not the raw event value (128)."""
-        s = QueueSession(_make_renderer(), _make_tracks(1))
-        s._dmr, calls = _mock_dmr_with_rc(scale_max=255)
-        s._on_event(MagicMock(), [_SV("Volume", 128)])
-        assert s._volume == 50
-        assert await s.get_volume() == 50
+        b = AvTransportBackend(_make_renderer())
+        b._dmr, calls = _mock_dmr_with_rc(scale_max=255)
+        b._handle_raw_event(MagicMock(), [_SV("Volume", 128)])
+        assert b._volume == 50
+        assert await b.get_volume() == 50
         assert "GetVolume" not in calls  # served from the normalized cache
 
     async def test_set_volume_direct_rc_raw_and_caches(self):
-        s = QueueSession(_make_renderer(), _make_tracks(1))
-        s._dmr, calls = _mock_dmr_with_rc(scale_max=100)
-        await s.set_volume(55)
-        assert s._volume == 55
+        b = AvTransportBackend(_make_renderer())
+        b._dmr, calls = _mock_dmr_with_rc(scale_max=100)
+        await b.set_volume(55)
+        assert b._volume == 55
         # raw 0-100 SetVolume (NOT a 0.0-1.0 fraction, NOT scaled by a bogus max)
         assert calls["SetVolume"][0] == {"InstanceID": 0, "Channel": "Master", "DesiredVolume": 55}
 
     async def test_set_volume_bogus_range_does_not_blast(self):
         """Linn advertises max 2^31-1; we must treat it as 0-100, NOT send ~858M."""
-        s = QueueSession(_make_renderer(), _make_tracks(1))
-        s._dmr, calls = _mock_dmr_with_rc(scale_max=2147483647)
-        await s.set_volume(40)
+        b = AvTransportBackend(_make_renderer())
+        b._dmr, calls = _mock_dmr_with_rc(scale_max=2147483647)
+        await b.set_volume(40)
         assert calls["SetVolume"][0]["DesiredVolume"] == 40  # raw 40, not 858993459
 
     async def test_set_volume_scales_when_range_is_sane_nonstandard(self):
-        s = QueueSession(_make_renderer(), _make_tracks(1))
-        s._dmr, calls = _mock_dmr_with_rc(scale_max=255)
-        await s.set_volume(100)
+        b = AvTransportBackend(_make_renderer())
+        b._dmr, calls = _mock_dmr_with_rc(scale_max=255)
+        await b.set_volume(100)
         assert calls["SetVolume"][0]["DesiredVolume"] == 255  # 100% of a 0-255 range
 
     async def test_set_mute_direct_rc_when_supported(self):
-        s = QueueSession(_make_renderer(), _make_tracks(1))
-        s._dmr, calls = _mock_dmr_with_rc()
-        await s.set_mute(True)
+        b = AvTransportBackend(_make_renderer())
+        b._dmr, calls = _mock_dmr_with_rc()
+        await b.set_mute(True)
         assert calls["SetMute"][0] == {"InstanceID": 0, "Channel": "Master", "DesiredMute": True}
 
     async def test_set_mute_clear_error_when_action_absent(self):
-        s = QueueSession(_make_renderer(), _make_tracks(1))
-        s._dmr, calls = _mock_dmr_with_rc(actions=("GetVolume", "SetVolume"))  # no SetMute
+        b = AvTransportBackend(_make_renderer())
+        b._dmr, calls = _mock_dmr_with_rc(actions=("GetVolume", "SetVolume"))  # no SetMute
         with pytest.raises(RuntimeError, match="does not support mute"):
-            await s.set_mute(True)
+            await b.set_mute(True)
         assert "SetMute" not in calls
 
     async def test_get_volume_returns_cache_without_polling(self):
-        s = QueueSession(_make_renderer(), _make_tracks(1))
-        s._dmr, calls = _mock_dmr_with_rc(current_volume=99)
-        s._volume = 33
-        assert await s.get_volume() == 33
+        b = AvTransportBackend(_make_renderer())
+        b._dmr, calls = _mock_dmr_with_rc(current_volume=99)
+        b._volume = 33
+        assert await b.get_volume() == 33
         assert "GetVolume" not in calls  # cache hit, no RC read
 
     async def test_get_volume_falls_back_to_direct_rc(self):
-        s = QueueSession(_make_renderer(), _make_tracks(1))
-        s._dmr, calls = _mock_dmr_with_rc(current_volume=40, scale_max=100)
-        assert s._volume is None
-        assert await s.get_volume() == 40
+        b = AvTransportBackend(_make_renderer())
+        b._dmr, calls = _mock_dmr_with_rc(current_volume=40, scale_max=100)
+        assert b._volume is None
+        assert await b.get_volume() == 40
         assert "GetVolume" in calls
-        assert s._volume == 40  # now cached
+        assert b._volume == 40  # now cached
 
     async def test_get_volume_none_when_rc_returns_none(self):
-        s = QueueSession(_make_renderer(), _make_tracks(1))
-        s._dmr, calls = _mock_dmr_with_rc(current_volume=None)
-        assert await s.get_volume() is None
+        b = AvTransportBackend(_make_renderer())
+        b._dmr, calls = _mock_dmr_with_rc(current_volume=None)
+        assert await b.get_volume() is None
 
     async def test_get_volume_none_when_no_dmr(self):
-        s = QueueSession(_make_renderer(), _make_tracks(1))
-        assert s._dmr is None
-        assert await s.get_volume() is None
+        b = AvTransportBackend(_make_renderer())
+        assert b.connected is False
+        assert await b.get_volume() is None
 
 
 class TestStopEventGuards:
@@ -919,15 +924,11 @@ class TestStopEventGuards:
     skip track 1 / tear down the session, and duplicate STOPPED events must not
     double-advance."""
 
-    def _ev(self, state):
-        return [_SV("TransportState", state)]
-
     async def test_transient_stop_before_play_does_not_advance_or_cleanup(self):
         s = QueueSession(_make_renderer(supports_next=False), _make_tracks(3))
-        s._dmr = MagicMock()
         s._auto_advance = AsyncMock()
         s._cleanup = AsyncMock()
-        s._on_event(MagicMock(), self._ev("STOPPED"))  # never reached PLAYING
+        s._on_transport_event("STOPPED", None)  # never reached PLAYING
         await asyncio.sleep(0)
         s._auto_advance.assert_not_awaited()
         s._cleanup.assert_not_awaited()
@@ -935,37 +936,86 @@ class TestStopEventGuards:
 
     async def test_stop_after_play_advances_once(self):
         s = QueueSession(_make_renderer(supports_next=False), _make_tracks(3))
-        s._dmr = MagicMock()
         s._auto_advance = AsyncMock()
-        s._on_event(MagicMock(), self._ev("PLAYING"))
-        s._on_event(MagicMock(), self._ev("STOPPED"))
+        s._on_transport_event("PLAYING", None)
+        s._on_transport_event("STOPPED", None)
         assert s._advancing is True  # set before scheduling
         await asyncio.sleep(0)
         s._auto_advance.assert_awaited_once()
 
     async def test_duplicate_stop_advances_only_once(self):
         s = QueueSession(_make_renderer(supports_next=False), _make_tracks(3))
-        s._dmr = MagicMock()
         s._auto_advance = AsyncMock()
-        s._on_event(MagicMock(), self._ev("PLAYING"))
-        s._on_event(MagicMock(), self._ev("STOPPED"))
-        s._on_event(MagicMock(), self._ev("STOPPED"))  # duplicate — guarded
+        s._on_transport_event("PLAYING", None)
+        s._on_transport_event("STOPPED", None)
+        s._on_transport_event("STOPPED", None)  # duplicate — guarded
         await asyncio.sleep(0)
         s._auto_advance.assert_awaited_once()
 
     async def test_transient_stop_single_track_does_not_cleanup(self):
         s = QueueSession(_make_renderer(), _make_tracks(1))
-        s._dmr = MagicMock()
         s._cleanup = AsyncMock()
-        s._on_event(MagicMock(), self._ev("STOPPED"))  # never played
+        s._on_transport_event("STOPPED", None)  # never played
         await asyncio.sleep(0)
         s._cleanup.assert_not_awaited()
 
     async def test_stop_after_play_last_track_cleans_up(self):
         s = QueueSession(_make_renderer(), _make_tracks(1))
-        s._dmr = MagicMock()
         s._cleanup = AsyncMock()
-        s._on_event(MagicMock(), self._ev("PLAYING"))
-        s._on_event(MagicMock(), self._ev("STOPPED"))
+        s._on_transport_event("PLAYING", None)
+        s._on_transport_event("STOPPED", None)
         await asyncio.sleep(0)
         s._cleanup.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# PlaybackBackend seam (Phase 1 backend extraction)
+# ---------------------------------------------------------------------------
+
+class TestBackendSeam:
+    """QueueSession owns the queue; the backend owns device I/O. These cover
+    the seam between them — selection, event forwarding, and the gapless
+    transition reaction (which the device-coupled tests above don't reach)."""
+
+    def test_make_backend_returns_avtransport(self):
+        backend = queue_manager._make_backend(_make_renderer())
+        assert isinstance(backend, AvTransportBackend)
+        assert backend.owns_queue is False
+
+    def test_backend_supports_next_reflects_renderer(self):
+        assert queue_manager._make_backend(_make_renderer(supports_next=True)).supports_next
+        assert not queue_manager._make_backend(_make_renderer(supports_next=False)).supports_next
+
+    def test_handle_raw_event_forwards_state_and_uri_to_session(self):
+        # The backend parses the raw event and forwards (state, uri) to whatever
+        # callback connect() wired — here a spy standing in for the session.
+        forwarded = []
+        b = _connected_backend()
+        b._on_event = lambda state, uri: forwarded.append((state, uri))
+        b._handle_raw_event(
+            MagicMock(),
+            [_SV("TransportState", "PLAYING"), _SV("CurrentTrackURI", "http://x/2.flac")],
+        )
+        assert forwarded == [("PLAYING", "http://x/2.flac")]
+
+    async def test_gapless_transition_adopts_preloaded_index(self):
+        # Renderer reports it switched to the preloaded track's URI → the session
+        # adopts the preloaded index and kicks off preloading the following one.
+        s = QueueSession(_make_renderer(supports_next=True), _make_tracks(3))
+        s._preloaded_index = 1
+        s._preload_next = AsyncMock()
+        s._on_transport_event("PLAYING", s.tracks[1].url)
+        await asyncio.sleep(0)
+        assert s.current_index == 1
+        assert s._preloaded_index is None
+        s._preload_next.assert_awaited_once()
+
+    async def test_unrelated_uri_does_not_trigger_transition(self):
+        s = QueueSession(_make_renderer(supports_next=True), _make_tracks(3))
+        s._preloaded_index = 1
+        s._preload_next = AsyncMock()
+        s._on_transport_event("PLAYING", "http://other/unknown.flac")
+        await asyncio.sleep(0)
+        assert s.current_index == 0  # unchanged
+        assert s._preloaded_index == 1
+        s._preload_next.assert_not_awaited()

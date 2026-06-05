@@ -5,7 +5,7 @@ import logging
 import socket
 import struct
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from xml.etree import ElementTree as ET
 
 import aiohttp
