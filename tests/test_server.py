@@ -1710,3 +1710,61 @@ class TestPerUdnLock:
         # second play stopped the first before starting its own).
         assert len(cp.get_all_sessions()) == 1
         assert order.count(("start", order[0][1])) == 1  # first start not duplicated
+
+
+# ---------------------------------------------------------------------------
+# T7/T8: metadata strategy (caller hints + family-aware protocolInfo) + memoize
+# ---------------------------------------------------------------------------
+
+from renfield_mcp_dlna import metadata as md_strategy  # noqa: E402
+
+
+class TestMetadataStrategy:
+    def test_audio_default_keeps_wildcard_4th_field(self):
+        # No regression for standard renderers: audio stays "*" unless hinted.
+        out = md_strategy.build(Track(url="http://x/a.flac", title="A"), _make_renderer())
+        assert "http-get:*:audio/flac:*" in out
+
+    def test_audio_caller_hints_win(self):
+        t = Track(url="http://x/a.mp3", title="A", mime_type="audio/mpeg",
+                  dlna_features="DLNA.ORG_OP=01")
+        out = md_strategy.build(t, _make_renderer())
+        assert "http-get:*:audio/mpeg:DLNA.ORG_OP=01" in out
+
+    def test_video_gets_dlna_flags_on_standard_renderer(self):
+        t = Track(url="http://x/v.mp4", title="V", media_type="video")
+        out = md_strategy.build(t, _make_renderer())
+        assert "video/mp4" in out
+        assert "DLNA.ORG_OP=01" in out
+        assert "DLNA.ORG_FLAGS=" in out
+
+    def test_video_on_tv_family_detected(self):
+        tv = _make_renderer(name="Samsung TV", udn="uuid:tv")
+        tv.manufacturer = "Samsung"
+        assert md_strategy._is_tv(tv) is True
+        out = md_strategy.build(Track(url="http://x/v.mp4", media_type="video"), tv)
+        assert "DLNA.ORG_FLAGS=" in out
+
+    def test_video_caller_features_override_strategy(self):
+        t = Track(url="http://x/v.mkv", media_type="video",
+                  mime_type="video/x-matroska", dlna_features="DLNA.ORG_PN=CUSTOM")
+        out = md_strategy.build(t, _make_renderer())
+        assert "video/x-matroska:DLNA.ORG_PN=CUSTOM" in out
+
+    def test_non_tv_renderer_not_flagged(self):
+        assert md_strategy._is_tv(_make_renderer()) is False  # HiFiBerry, no mfr
+
+
+class TestMetadataMemoization:
+    def test_build_metadata_caches_per_url(self):
+        s = QueueSession(_make_renderer(), [Track(url="http://x/a.flac", title="A")])
+        first = s._build_metadata(s.tracks[0])
+        assert s._metadata_cache["http://x/a.flac"] == first
+
+    def test_build_metadata_does_not_rebuild_cached(self):
+        s = QueueSession(_make_renderer(), [Track(url="http://x/a.flac", title="A")])
+        first = s._build_metadata(s.tracks[0])
+        with patch.object(queue_manager.metadata, "build") as mb:
+            second = s._build_metadata(s.tracks[0])
+            mb.assert_not_called()  # served from cache, no rebuild
+        assert second == first

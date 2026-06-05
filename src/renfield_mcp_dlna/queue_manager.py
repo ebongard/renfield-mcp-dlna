@@ -27,6 +27,7 @@ import logging
 import time
 from dataclasses import dataclass
 
+from . import metadata
 from .backends import AvTransportBackend, PlaybackBackend
 from .backends.base import TRANSPORT_DEAD, TRANSPORT_OK
 from .control_point import ControlPoint
@@ -53,6 +54,10 @@ class Track:
     album: str = ""
     art_url: str = ""
     media_type: str = "audio"  # "audio" or "video"
+    # Optional caller hints for metadata negotiation (win over the strategy
+    # default): the source's MIME and the DLNA 4th-field (DLNA.ORG_PN/OP/FLAGS).
+    mime_type: str = ""
+    dlna_features: str = ""
 
 
 def _make_backend(renderer: DlnaRenderer) -> PlaybackBackend:
@@ -103,16 +108,19 @@ class QueueSession:
         # Guards the no-SetNext auto-advance against duplicate STOPPED events
         # firing a second _auto_advance before the first incremented the index.
         self._advancing = False
+        # Negotiated metadata memoised per track URL so preload + re-advance of
+        # the same track don't rebuild it (keyed by URL within this session =
+        # the (url, UDN) key from the plan, since a session is one renderer).
+        self._metadata_cache: dict[str, str] = {}
 
     def _build_metadata(self, track: Track) -> str:
-        """Build DIDL-Lite metadata based on track media type."""
-        if track.media_type == "video":
-            from .didl import build_video_didl_metadata
-            return build_video_didl_metadata(track.url, track.title)
-        from .didl import build_didl_metadata
-        return build_didl_metadata(
-            track.url, track.title, track.artist, track.album, track.art_url
-        )
+        """Build (and memoise) DIDL-Lite metadata via the device-family strategy."""
+        cached = self._metadata_cache.get(track.url)
+        if cached is not None:
+            return cached
+        built = metadata.build(track, self.renderer)
+        self._metadata_cache[track.url] = built
+        return built
 
     async def start(self) -> None:
         """Connect + subscribe, play track 1, preload track 2."""

@@ -139,6 +139,8 @@ async def play_tracks(
                 album=t.get("album", ""),
                 art_url=t.get("art_url", ""),
                 media_type=t.get("media_type", "audio"),
+                mime_type=t.get("mime_type", ""),
+                dlna_features=t.get("dlna_features", ""),
             )
         )
 
