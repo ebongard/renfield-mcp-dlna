@@ -11,9 +11,11 @@ license = {text = "MIT"}
 requires-python = ">=3.11"
 dependencies = [
     "mcp>=1.26.0",
-    "async-upnp-client>=0.40.0",
+    "async-upnp-client>=0.47.0",
     "python-didl-lite>=1.4.0",
     "aiohttp>=3.9.0",
+    "defusedxml>=0.7",
+    "ifaddr>=0.2",
 ]
 
 [project.scripts]
@@ -23,6 +25,11 @@ renfield-mcp-dlna = "renfield_mcp_dlna.server:main"
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
+]
+# Sonos support (provisional): wraps the soco library. Enable at runtime with
+# RENFIELD_SONOS=1.
+sonos = [
+    "soco>=0.30",
 ]
 
 [tool.setuptools.packages.find]

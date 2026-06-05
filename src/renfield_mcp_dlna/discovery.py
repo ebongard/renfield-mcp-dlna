@@ -5,10 +5,16 @@ import logging
 import socket
 import struct
 import time
-from dataclasses import dataclass, field
-from xml.etree import ElementTree as ET
+from dataclasses import dataclass
+from urllib.parse import urlparse
 
 import aiohttp
+
+# defusedxml: device descriptions come from LAN devices and UPnP is spoofable,
+# so parse untrusted XML with the hardened parser (blocks billion-laughs entity
+# expansion / XXE that stdlib ElementTree allows).
+import defusedxml.ElementTree as ET  # noqa: N817
+from defusedxml.common import DefusedXmlException
 
 logger = logging.getLogger(__name__)
 
@@ -27,9 +33,19 @@ _SEARCH_TARGET = "urn:schemas-upnp-org:device:MediaRenderer:1"
 CACHE_TTL = 300  # 5 minutes
 
 
+# Version-flexible: real Linn advertises Playlist:1 / Volume:4 etc. Match the
+# service-type prefix, not an exact version.
+_OPENHOME_PLAYLIST_PREFIX = "urn:av-openhome-org:service:Playlist:"
+
+
 @dataclass
 class DlnaRenderer:
-    """Discovered DLNA MediaRenderer."""
+    """Discovered DLNA MediaRenderer.
+
+    Identity fields (manufacturer/model) feed the backend factory's
+    device-class selection; is_openhome flags renderers (Linn et al.) that
+    expose the av-openhome-org Playlist service for native device-side queues.
+    """
 
     name: str
     udn: str
@@ -38,10 +54,38 @@ class DlnaRenderer:
     av_transport_control_url: str
     rendering_control_url: str = ""
     base_url: str = ""
+    manufacturer: str = ""
+    model_name: str = ""
+    is_openhome: bool = False
+    is_sonos: bool = False
+    # OpenHome renderers (Linn) expose their av-openhome-org services on a
+    # SEPARATE root device (urn:linn-co-uk:device:Source:1) with a different UDN
+    # but the same host. When discovery finds that sibling, this points at its
+    # device description so OpenHomeBackend can build from it.
+    openhome_location: str = ""
 
 
 _renderer_cache: list[DlnaRenderer] = []
 _cache_time: float = 0
+
+_CONTENT_DIRECTORY_PREFIX = "urn:schemas-upnp-org:service:ContentDirectory:"
+
+
+@dataclass
+class DlnaServer:
+    """Discovered DLNA MediaServer (exposes a ContentDirectory to browse)."""
+
+    name: str
+    udn: str
+    location: str
+    content_directory_control_url: str
+    base_url: str = ""
+    manufacturer: str = ""
+    model_name: str = ""
+
+
+_server_cache: list[DlnaServer] = []
+_server_cache_time: float = 0
 
 
 def _build_msearch(search_target: str = _SEARCH_TARGET) -> bytes:
@@ -73,9 +117,13 @@ def _base_url_from_location(location: str) -> str:
 
 
 async def _ssdp_search_single(
-    search_target: str, timeout: float = 6.0
+    search_target: str, timeout: float = 6.0, source_ip: str | None = None
 ) -> list[str]:
-    """Send SSDP M-SEARCH for a single ST and collect LOCATION URLs."""
+    """Send SSDP M-SEARCH for a single ST and collect LOCATION URLs.
+
+    source_ip binds the socket to a specific local interface (for multi-homed
+    hosts). None keeps the default-route behaviour (unchanged).
+    """
     locations: list[str] = []
     msg = _build_msearch(search_target)
 
@@ -86,6 +134,13 @@ async def _ssdp_search_single(
         socket.IP_MULTICAST_TTL,
         struct.pack("b", 4),
     )
+    if source_ip:
+        # Send the multicast query out of this specific interface. On failure
+        # (interface gone) the caller treats the whole search as empty.
+        sock.bind((source_ip, 0))
+        sock.setsockopt(
+            socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(source_ip)
+        )
     # Keep socket blocking — recv is run in executor thread.
     # select() provides the timeout; recv() blocks until data arrives.
     sock.setblocking(True)
@@ -133,22 +188,58 @@ async def _ssdp_search_single(
     return locations
 
 
+def _local_ipv4_addresses() -> list[str]:
+    """Best-effort list of this host's non-loopback IPv4 interface addresses.
+
+    Used to M-SEARCH from every interface on a multi-homed host. Returns [] if
+    enumeration isn't available (ifaddr missing / error), in which case discovery
+    falls back to the default-route search only — no regression.
+    """
+    try:
+        import ifaddr
+    except Exception:  # noqa: BLE001 - optional; default-route path still works
+        return []
+    addrs: list[str] = []
+    try:
+        for adapter in ifaddr.get_adapters():
+            for ip in adapter.ips:
+                addr = ip.ip
+                # IPv4 ips are plain strings; IPv6 are (addr, flowinfo, scope) tuples.
+                if isinstance(addr, str) and not addr.startswith("127."):
+                    addrs.append(addr)
+    except Exception:  # noqa: BLE001 - best-effort
+        return []
+    return addrs
+
+
 async def _ssdp_search(timeout: float = 5.0) -> list[str]:
     """Send SSDP M-SEARCH for MediaRenderer and rootdevice, merge results.
 
     Some devices (e.g. Linn/ohNet) don't respond to the MediaRenderer search
     target but do support AVTransport. Searching for upnp:rootdevice as well
     catches these devices.  Filtering by AVTransport happens later.
+
+    Additive multi-interface: always runs the default-route search (unchanged),
+    PLUS one search per local interface on multi-homed hosts. Per-interface
+    failures are swallowed so they can't break the default path.
     """
-    results = await asyncio.gather(
-        _ssdp_search_single(_SEARCH_TARGET, timeout),
-        _ssdp_search_single("upnp:rootdevice", timeout),
-    )
-    # Merge and deduplicate
+    targets = (_SEARCH_TARGET, "upnp:rootdevice")
+    searches = [_ssdp_search_single(st, timeout) for st in targets]  # default route
+    for source_ip in _local_ipv4_addresses():
+        searches.extend(
+            _ssdp_search_single(st, timeout, source_ip=source_ip) for st in targets
+        )
+
+    results = await asyncio.gather(*searches, return_exceptions=True)
+    # Merge and deduplicate; ignore any per-search exception (e.g. an interface
+    # that vanished).
     seen: set[str] = set()
     locations: list[str] = []
-    for loc_list in results:
-        for loc in loc_list:
+    for result in results:
+        if isinstance(result, BaseException):
+            logger.debug(f"SSDP search leg failed: {result}")
+            continue
+        for loc in result:
             if loc not in seen:
                 seen.add(loc)
                 locations.append(loc)
@@ -170,7 +261,7 @@ async def _fetch_device_description(
 
     try:
         root = ET.fromstring(xml_text)
-    except ET.ParseError:
+    except (ET.ParseError, DefusedXmlException):
         return None
 
     device = root.find(f"{{{_NS_DEVICE}}}device")
@@ -184,9 +275,14 @@ async def _fetch_device_description(
         logger.debug(f"No UDN for device '{friendly_name}' at {location}")
         return None
 
+    # Identity drives backend-class selection downstream.
+    manufacturer = device.findtext(f"{{{_NS_DEVICE}}}manufacturer", "")
+    model_name = device.findtext(f"{{{_NS_DEVICE}}}modelName", "")
+
     base_url = _base_url_from_location(location)
     av_control_url = ""
     rc_control_url = ""
+    is_openhome = False
 
     service_list = device.find(f"{{{_NS_DEVICE}}}serviceList")
     if service_list is None:
@@ -206,6 +302,11 @@ async def _fetch_device_description(
             )
         elif service_type == _RENDERING_CONTROL_TYPE:
             rc_control_url = control_url or ""
+        elif service_type.startswith(_OPENHOME_PLAYLIST_PREFIX):
+            # OpenHome services on the renderer's OWN description (some devices
+            # combine them); Linn instead puts them on a sibling device, handled
+            # by the host-correlation pass in discover_renderers.
+            is_openhome = True
 
     if not av_control_url:
         logger.debug(f"No AVTransport service for '{friendly_name}' at {location}")
@@ -225,6 +326,10 @@ async def _fetch_device_description(
         av_transport_control_url=av_control_url,
         rendering_control_url=rc_control_url,
         base_url=base_url,
+        manufacturer=manufacturer,
+        model_name=model_name,
+        is_openhome=is_openhome,
+        is_sonos="sonos" in manufacturer.lower(),
     )
 
 
@@ -246,7 +351,7 @@ async def _check_set_next_support(
 
     try:
         root = ET.fromstring(xml_text)
-    except ET.ParseError:
+    except (ET.ParseError, DefusedXmlException):
         return False
 
     # Search for action name in SCPD
@@ -256,6 +361,41 @@ async def _check_set_next_support(
             return True
 
     return False
+
+
+async def _fetch_openhome_location(
+    session: aiohttp.ClientSession, location: str
+) -> tuple[str, str] | None:
+    """If `location` describes an OpenHome device (advertises an av-openhome-org
+    Playlist service), return (host, location); else None.
+
+    Real Linn renderers expose OpenHome on a SEPARATE root device (e.g.
+    urn:linn-co-uk:device:Source:1) from the standard MediaRenderer, so this is
+    correlated back to the renderer by host in discover_renderers.
+    """
+    try:
+        async with session.get(location, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+            if resp.status != 200:
+                return None
+            xml_text = await resp.text()
+    except Exception:
+        return None
+    try:
+        root = ET.fromstring(xml_text)
+    except (ET.ParseError, DefusedXmlException):
+        return None
+    device = root.find(f"{{{_NS_DEVICE}}}device")
+    if device is None:
+        return None
+    service_list = device.find(f"{{{_NS_DEVICE}}}serviceList")
+    if service_list is None:
+        return None
+    for service in service_list.findall(f"{{{_NS_DEVICE}}}service"):
+        st = service.findtext(f"{{{_NS_DEVICE}}}serviceType", "")
+        if st.startswith(_OPENHOME_PLAYLIST_PREFIX):
+            host = urlparse(location).hostname or ""
+            return (host, location)
+    return None
 
 
 async def discover_renderers(force: bool = False) -> list[DlnaRenderer]:
@@ -274,37 +414,156 @@ async def discover_renderers(force: bool = False) -> list[DlnaRenderer]:
 
     renderers: list[DlnaRenderer] = []
     async with aiohttp.ClientSession() as session:
-        tasks = [_fetch_device_description(session, loc) for loc in locations]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
+        results = await asyncio.gather(
+            *(_fetch_device_description(session, loc) for loc in locations),
+            return_exceptions=True,
+        )
         for result in results:
             if isinstance(result, DlnaRenderer):
                 renderers.append(result)
             elif isinstance(result, Exception):
                 logger.debug(f"Device description fetch failed: {result}")
 
+        # Correlate OpenHome sibling devices (separate root device, same host)
+        # back onto their renderer, so Linn et al. are flagged is_openhome with
+        # a pointer to the OpenHome device description.
+        oh_results = await asyncio.gather(
+            *(_fetch_openhome_location(session, loc) for loc in locations),
+            return_exceptions=True,
+        )
+        oh_by_host: dict[str, str] = {}
+        for oh in oh_results:
+            if isinstance(oh, tuple):
+                host, oh_loc = oh
+                oh_by_host.setdefault(host, oh_loc)
+
+    for r in renderers:
+        host = urlparse(r.location).hostname or ""
+        if host in oh_by_host:
+            r.is_openhome = True
+            r.openhome_location = oh_by_host[host]
+
     _renderer_cache = renderers
     _cache_time = time.time()
     logger.info(
         f"Discovered {len(renderers)} renderer(s): "
-        + ", ".join(f"{r.name} (next={r.supports_next})" for r in renderers)
+        + ", ".join(
+            f"{r.name} (next={r.supports_next}, openhome={r.is_openhome})"
+            for r in renderers
+        )
     )
     return renderers
 
 
 async def find_renderer(name: str) -> DlnaRenderer | None:
     """Find a renderer by case-insensitive substring match on friendly name."""
-    renderers = await discover_renderers()
+    return _match_by_name(await discover_renderers(), name)
+
+
+# ---------------------------------------------------------------------------
+# MediaServer (ContentDirectory) discovery
+# ---------------------------------------------------------------------------
+
+
+async def _fetch_server_description(
+    session: aiohttp.ClientSession, location: str
+) -> DlnaServer | None:
+    """Fetch a device description and parse it as a MediaServer (one that
+    exposes a ContentDirectory service). Returns None for non-servers."""
+    try:
+        async with session.get(location, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+            if resp.status != 200:
+                return None
+            xml_text = await resp.text()
+    except Exception as e:
+        logger.debug(f"Failed to fetch {location}: {e}")
+        return None
+
+    try:
+        root = ET.fromstring(xml_text)
+    except (ET.ParseError, DefusedXmlException):
+        return None
+
+    device = root.find(f"{{{_NS_DEVICE}}}device")
+    if device is None:
+        return None
+
+    udn = device.findtext(f"{{{_NS_DEVICE}}}UDN", "")
+    if not udn:
+        return None
+    friendly_name = device.findtext(f"{{{_NS_DEVICE}}}friendlyName", "")
+    manufacturer = device.findtext(f"{{{_NS_DEVICE}}}manufacturer", "")
+    model_name = device.findtext(f"{{{_NS_DEVICE}}}modelName", "")
+    base_url = _base_url_from_location(location)
+
+    service_list = device.find(f"{{{_NS_DEVICE}}}serviceList")
+    if service_list is None:
+        return None
+
+    cd_control_url = ""
+    for service in service_list.findall(f"{{{_NS_DEVICE}}}service"):
+        service_type = service.findtext(f"{{{_NS_DEVICE}}}serviceType", "")
+        if service_type.startswith(_CONTENT_DIRECTORY_PREFIX):
+            cd_control_url = service.findtext(f"{{{_NS_DEVICE}}}controlURL", "") or ""
+            break
+
+    if not cd_control_url:
+        return None  # not a MediaServer
+    if not cd_control_url.startswith("http"):
+        cd_control_url = base_url + cd_control_url
+
+    return DlnaServer(
+        name=friendly_name,
+        udn=udn,
+        location=location,
+        content_directory_control_url=cd_control_url,
+        base_url=base_url,
+        manufacturer=manufacturer,
+        model_name=model_name,
+    )
+
+
+async def discover_servers(force: bool = False) -> list[DlnaServer]:
+    """Discover DLNA MediaServers on the network (5-minute cache)."""
+    global _server_cache, _server_cache_time
+
+    if not force and _server_cache and (time.time() - _server_cache_time) < CACHE_TTL:
+        return _server_cache
+
+    logger.info("Starting SSDP discovery for DLNA servers...")
+    locations = await _ssdp_search()
+
+    servers: list[DlnaServer] = []
+    async with aiohttp.ClientSession() as session:
+        tasks = [_fetch_server_description(session, loc) for loc in locations]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for result in results:
+            if isinstance(result, DlnaServer):
+                servers.append(result)
+            elif isinstance(result, Exception):
+                logger.debug(f"Server description fetch failed: {result}")
+
+    _server_cache = servers
+    _server_cache_time = time.time()
+    logger.info(
+        f"Discovered {len(servers)} server(s): "
+        + ", ".join(s.name for s in servers)
+    )
+    return servers
+
+
+async def find_server(name: str) -> DlnaServer | None:
+    """Find a MediaServer by case-insensitive substring match on friendly name."""
+    return _match_by_name(await discover_servers(), name)
+
+
+def _match_by_name(devices: list, name: str):
+    """Exact (case-insensitive) match first, then substring, on .name."""
     name_lower = name.lower()
-
-    # Exact match first
-    for r in renderers:
-        if r.name.lower() == name_lower:
-            return r
-
-    # Substring match
-    for r in renderers:
-        if name_lower in r.name.lower():
-            return r
-
+    for d in devices:
+        if d.name.lower() == name_lower:
+            return d
+    for d in devices:
+        if name_lower in d.name.lower():
+            return d
     return None

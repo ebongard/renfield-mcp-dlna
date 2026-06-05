@@ -1,92 +1,53 @@
-"""Queue state machine for DLNA renderer playback with UPnP event subscription."""
+"""Queue state machine for DLNA renderer playback.
+
+A QueueSession owns the queue (track list + current index) and reacts to
+transport events to drive gapless transitions and auto-advance. It delegates
+all device I/O — playing a URI, preloading the next, volume/mute, polling — to
+a PlaybackBackend (default: AvTransportBackend). See backends/base.py for the
+split of responsibility.
+
+Auto-advance / gapless state machine (driven by _on_transport_event):
+
+            play_uri(track 1)
+  idle ───────────────────▶ buffering ──PLAYING──▶ playing
+   ▲                            │ (prior state OK)     │
+   │                     STOPPED/NO_MEDIA              │ gapless: CurrentTrackURI
+   │                     (pre-play, prior state NOT    │   == preloaded.url → adopt
+   │                      OK: ignored — no advance)    │   preloaded index, preload next
+   └──── _cleanup ◀── STOPPED (last track, played) ────│
+              ▲                                         │
+              └── no-SetNext: STOPPED (played) ────────▶ _auto_advance (deduped via _advancing)
+
+  "played" = the renderer's PRIOR reported state was PLAYING/PAUSED (_prev_transport_state),
+  so a transient STOPPED during buffering — or after a TRANSITIONING — is never read as track-end.
+"""
 
 import asyncio
 import logging
 import os
-import socket
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
-from async_upnp_client.aiohttp import AiohttpNotifyServer, AiohttpRequester
-from async_upnp_client.client_factory import UpnpFactory
-from async_upnp_client.event_handler import UpnpEventHandler
-from async_upnp_client.profiles.dlna import DmrDevice
-
-from .didl import build_didl_metadata
+from . import metadata
+from .backends import (
+    AvTransportBackend,
+    OpenHomeBackend,
+    PlaybackBackend,
+    SonosBackend,
+)
+from .backends.base import TRANSPORT_DEAD, TRANSPORT_OK
+from .control_point import ControlPoint
 from .discovery import DlnaRenderer
 
 logger = logging.getLogger(__name__)
 
-# Module-level shared UPnP event infrastructure
-_requester: AiohttpRequester | None = None
-_notify_server: AiohttpNotifyServer | None = None
-_event_handler: UpnpEventHandler | None = None
-_factory: UpnpFactory | None = None
-
-# Session registry: renderer UDN → QueueSession
-_sessions: dict[str, "QueueSession"] = {}
-
-# UPnP AVTransport TransportState values (raw strings from LAST_CHANGE events).
-# A renderer that actually started playback reaches PLAYING; one that couldn't
-# fetch/decode the stream stays STOPPED / NO_MEDIA_PRESENT.
-_TRANSPORT_OK = {"PLAYING", "PAUSED_PLAYBACK"}
-_TRANSPORT_DEAD = {"STOPPED", "NO_MEDIA_PRESENT"}
 # How long start() waits for the renderer to confirm it began playing.
 _PLAYBACK_CONFIRM_TIMEOUT = 5.0
 _PLAYBACK_CONFIRM_INTERVAL = 0.5
-# Hard wall-clock budget for a single GetTransportInfo poll. async_update()
-# issues several sequential SOAP calls (and a larger burst on the first poll),
-# each with the library's default 5s timeout — without a budget a hung renderer
-# could block get_status for tens of seconds.
-_TRANSPORT_POLL_TIMEOUT = 3.0
 
-_RENDERING_CONTROL_TYPE = "urn:schemas-upnp-org:service:RenderingControl:1"
-
-
-def _detect_local_ip() -> str:
-    """Detect local IP that can reach the network (for UPnP callback URL)."""
-    env_ip = os.environ.get("DLNA_LISTEN_IP")
-    if env_ip:
-        return env_ip
-    # Connect to a public IP to determine our local interface
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(("239.255.255.250", 1900))
-        return s.getsockname()[0]
-    except Exception:
-        return "0.0.0.0"
-    finally:
-        s.close()
-
-
-async def _ensure_infrastructure() -> None:
-    """Start shared notify server + event handler (idempotent)."""
-    global _requester, _notify_server, _event_handler, _factory
-    if _notify_server is not None:
-        return
-
-    source_ip = _detect_local_ip()
-    _requester = AiohttpRequester()
-    _notify_server = AiohttpNotifyServer(
-        requester=_requester,
-        source=(source_ip, 0),  # OS picks free port
-    )
-    _event_handler = UpnpEventHandler(_notify_server, _requester)
-    _factory = UpnpFactory(_requester)
-    await _notify_server.async_start_server()
-    logger.info(
-        f"UPnP notify server started on {source_ip}, "
-        f"callback: {_notify_server.callback_url}"
-    )
-
-
-async def _shutdown_infrastructure() -> None:
-    """Stop notify server when no sessions remain."""
-    global _notify_server, _requester, _event_handler, _factory
-    if _notify_server:
-        await _notify_server.async_stop_server()
-        logger.info("UPnP notify server stopped")
-    _notify_server = _requester = _event_handler = _factory = None
+# Default control point backing the module-level play_tracks/get_session facade.
+# Owns the shared UPnP infra + session registry that used to be module globals.
+_default_control_point = ControlPoint()
 
 
 @dataclass
@@ -99,57 +60,109 @@ class Track:
     album: str = ""
     art_url: str = ""
     media_type: str = "audio"  # "audio" or "video"
+    # Optional caller hints for metadata negotiation (win over the strategy
+    # default): the source's MIME and the DLNA 4th-field (DLNA.ORG_PN/OP/FLAGS).
+    mime_type: str = ""
+    dlna_features: str = ""
+
+
+def _make_backend(renderer: DlnaRenderer) -> PlaybackBackend:
+    """Select the playback backend for a renderer.
+
+    The OpenHome and Sonos backends slot in here (keyed on advertised services /
+    identity) without QueueSession changing — that's the point of the
+    PlaybackBackend seam. OpenHome renderers are detected at discovery
+    (renderer.is_openhome); until OpenHomeBackend lands (Phase 5) they still use
+    AVTransport, which they also advertise.
+    """
+    # SonosBackend (soco) is PROVISIONAL + needs the optional `soco` dep, so it's
+    # opt-in via RENFIELD_SONOS=1. Without it, generic AVTransport gives basic
+    # single-device control.
+    if renderer.is_sonos and os.getenv("RENFIELD_SONOS") == "1":
+        logger.info(f"[{renderer.name}] using SonosBackend (RENFIELD_SONOS=1)")
+        return SonosBackend(renderer)
+
+    # OpenHome renderers (Linn) use the native Playlist backend by DEFAULT — it's
+    # validated end-to-end on real hardware (discovery + volume + playback) and is
+    # the better path (device-owned gapless queue, reliable Volume service vs the
+    # bogus-range RenderingControl workaround). RENFIELD_OPENHOME=0 is the safety
+    # opt-out back to AVTransport.
+    if renderer.is_openhome and os.getenv("RENFIELD_OPENHOME") != "0":
+        logger.info(f"[{renderer.name}] using OpenHomeBackend (native Playlist)")
+        return OpenHomeBackend(renderer)
+    return AvTransportBackend(renderer)
 
 
 class QueueSession:
     """Manages queue playback on a single DLNA renderer.
 
-    Uses UPnP event subscription (LAST_CHANGE) for track transition
-    detection — no polling.
+    Uses UPnP event subscription (LAST_CHANGE, via the backend) for track
+    transition detection, with an active-poll fallback for event-silent
+    renderers.
     """
 
-    def __init__(self, renderer: DlnaRenderer, tracks: list[Track]):
+    def __init__(
+        self,
+        renderer: DlnaRenderer,
+        tracks: list[Track],
+        control_point: ControlPoint | None = None,
+    ):
         self.renderer = renderer
         self.tracks = tracks
+        self.control_point = control_point or _default_control_point
         self.current_index = 0
-        self._dmr: DmrDevice | None = None
+        self.backend: PlaybackBackend = _make_backend(renderer)
         self._preloaded_index: int | None = None
-        # Last TransportState reported by the renderer via LAST_CHANGE events.
-        # Source of truth for status() — never assume "playing" just because a
-        # renderer is bound.
-        self._transport_state: str | None = None
-        # Last RenderingControl Volume (0-100) seen via LAST_CHANGE events or
-        # written by set_volume — cached so get_volume avoids a SOAP round-trip.
-        self._volume: int | None = None
+        # Session-side mirror of the renderer's last-reported TransportState,
+        # used only for the "did it actually play *before* this STOPPED?" gate.
+        # Kept here (not read from the backend) because the backend updates its
+        # own cache to the CURRENT state before invoking our callback, so we'd
+        # lose the prior value. This reproduces the original per-event logic
+        # exactly — a sticky "has ever played" flag would mishandle a
+        # TRANSITIONING state landing between PLAYING and a transient STOPPED.
+        self._prev_transport_state: str | None = None
         # Guards the no-SetNext auto-advance against duplicate STOPPED events
         # firing a second _auto_advance before the first incremented the index.
         self._advancing = False
+        # Negotiated metadata memoised per track URL so preload + re-advance of
+        # the same track don't rebuild it (keyed by URL within this session =
+        # the (url, UDN) key from the plan, since a session is one renderer).
+        self._metadata_cache: dict[str, str] = {}
 
     def _build_metadata(self, track: Track) -> str:
-        """Build DIDL-Lite metadata based on track media type."""
-        if track.media_type == "video":
-            from .didl import build_video_didl_metadata
-            return build_video_didl_metadata(track.url, track.title)
-        return build_didl_metadata(track.url, track.title, track.artist, track.album, track.art_url)
+        """Build (and memoise) DIDL-Lite metadata via the device-family strategy."""
+        cached = self._metadata_cache.get(track.url)
+        if cached is not None:
+            return cached
+        built = metadata.build(track, self.renderer)
+        self._metadata_cache[track.url] = built
+        return built
 
     async def start(self) -> None:
-        """Subscribe to events, play track 1, preload track 2."""
-        await _ensure_infrastructure()
-        assert _factory is not None
-        assert _event_handler is not None
+        """Connect + subscribe, play track 1, preload track 2."""
+        await self.control_point.ensure_started()
+        assert self.control_point.factory is not None
+        assert self.control_point.event_handler is not None
 
-        device = await _factory.async_create_device(self.renderer.location)
-        self._dmr = DmrDevice(device, event_handler=_event_handler)
-        self._dmr.on_event = self._on_event
+        await self.backend.connect(
+            self._on_transport_event,
+            factory=self.control_point.factory,
+            event_handler=self.control_point.event_handler,
+        )
 
-        # Subscribe to AVTransport events
-        await self._dmr.async_subscribe_services(auto_resubscribe=True)
+        # Device-owned queue (OpenHome): hand the whole queue over once; the
+        # device manages playback + gapless transitions itself.
+        if self.backend.owns_queue:
+            items = [(t.url, t.title, self._build_metadata(t)) for t in self.tracks]
+            await self.backend.load_queue(items, start_index=0)
+            logger.info(
+                f"[{self.renderer.name}] Loaded device queue: "
+                f"{len(self.tracks)} track(s)"
+            )
+            return
 
-        # Play first track
         track = self.tracks[0]
-        metadata = self._build_metadata(track)
-        await self._dmr.async_set_transport_uri(track.url, track.title, metadata)
-        await self._dmr.async_play()
+        await self.backend.play_uri(track.url, track.title, self._build_metadata(track))
 
         # Verify the renderer actually started — a 404/unreachable stream leaves
         # it STOPPED/NO_MEDIA_PRESENT. Surface that as a failure instead of
@@ -158,8 +171,7 @@ class QueueSession:
 
         logger.info(f"[{self.renderer.name}] Playing track 1/{len(self.tracks)}: {track.title}")
 
-        # Preload second track if renderer supports it
-        if len(self.tracks) > 1 and self.renderer.supports_next:
+        if len(self.tracks) > 1 and self.backend.supports_next:
             await self._preload_next()
 
     async def _confirm_playback_started(self, title: str) -> None:
@@ -175,15 +187,15 @@ class QueueSession:
         # so summing the sleep interval would badly undercount elapsed time.
         deadline = time.monotonic() + _PLAYBACK_CONFIRM_TIMEOUT
         while time.monotonic() < deadline:
-            state = (self._transport_state or "").upper()
+            state = (self.backend.transport_state or "").upper()
             # Renderers that don't emit LAST_CHANGE events (e.g. HiFiBerryOS)
-            # never populate _transport_state — actively poll GetTransportInfo
+            # never populate transport_state — actively poll GetTransportInfo
             # so we can still confirm (or rule out) playback.
             if not state:
-                state = (await self._query_transport_state()) or ""
-            if state in _TRANSPORT_OK:
+                state = (await self.backend.query_transport_state()) or ""
+            if state in TRANSPORT_OK:
                 return
-            if state in _TRANSPORT_DEAD:
+            if state in TRANSPORT_DEAD:
                 raise RuntimeError(
                     f"renderer did not start playback (state={state}); "
                     f"stream may be unreachable: {title}"
@@ -191,105 +203,35 @@ class QueueSession:
             await asyncio.sleep(_PLAYBACK_CONFIRM_INTERVAL)
         logger.warning(
             f"[{self.renderer.name}] playback start unconfirmed for '{title}' "
-            f"(last state={self._transport_state})"
+            f"(last state={self.backend.transport_state})"
         )
-
-    async def _query_transport_state(self) -> str | None:
-        """Actively poll the renderer for its current TransportState.
-
-        Fallback for renderers that don't emit LAST_CHANGE events: calls
-        GetTransportInfo via async_update() and returns the raw UPnP state
-        string (e.g. "PLAYING"), or None if the poll fails / yields nothing.
-        """
-        if self._dmr is None:
-            return None
-        try:
-            await asyncio.wait_for(
-                self._dmr.async_update(), timeout=_TRANSPORT_POLL_TIMEOUT
-            )
-        except Exception as e:  # noqa: BLE001 - refresh is best-effort
-            # Fall through: the lib keeps transport_state fresh from the event
-            # subscription, so a failed/timed-out active refresh shouldn't blank
-            # an otherwise-known state.
-            logger.debug(f"[{self.renderer.name}] transport poll refresh failed: {e}")
-        ts = self._dmr.transport_state
-        if ts is None:
-            return None
-        state = str(getattr(ts, "value", ts) or "").upper()
-        # The lib returns VENDOR_DEFINED when the state var exists but was never
-        # populated — that's "unknown", not a real transport state.
-        if not state or state == "VENDOR_DEFINED":
-            return None
-        return state
 
     async def refresh_state(self) -> None:
-        """Best-effort refresh of the cached TransportState via an active poll.
+        """Best-effort refresh of the backend's cached TransportState.
 
         Called by get_status so status() reports the renderer's true state even
-        on event-silent renderers. Leaves the last known state untouched if the
-        poll fails."""
-        polled = await self._query_transport_state()
-        if polled:
-            self._transport_state = polled
+        on event-silent renderers."""
+        await self.backend.refresh()
 
-    def _on_event(self, service, state_variables) -> None:
-        """Handle AVTransport LAST_CHANGE events.
+    def _on_transport_event(
+        self, transport_state: str | None, current_uri: str | None
+    ) -> None:
+        """React to a parsed transport event forwarded by the backend.
 
-        async_upnp_client delivers a **list** of changed UpnpStateVariable
-        objects (each with .name/.value), NOT a dict — calling .get() on it
-        raised AttributeError, which meant TransportState was never captured
-        (so status reported "unknown") and gapless-transition / auto-advance
-        detection silently never fired. Fold the list into a name->value map;
-        a dict is tolerated defensively for forward/backward compat.
+        The backend has already cached transport_state/volume; this method owns
+        only the *queue* consequences: gapless transition, auto-advance, and
+        end-of-queue cleanup.
         """
-        if not state_variables:
-            return
-
-        if isinstance(state_variables, dict):
-            changes = state_variables
-        else:
-            changes = {
-                getattr(sv, "name", None): getattr(sv, "value", None)
-                for sv in state_variables
-            }
-
-        transport_state = changes.get("TransportState")
-        current_uri = changes.get("CurrentTrackURI")
-
-        # RenderingControl Volume rides on the same event stream; cache it so
-        # get_volume can answer without a SOAP round-trip. The event value is in
-        # the renderer's native units, so normalise to percent with the same
-        # scale get_volume/set_volume use — otherwise a 0-255 renderer would
-        # cache 128 and report it as "128%".
-        volume = changes.get("Volume")
-        if volume is not None:
-            try:
-                raw = int(volume)
-            except (TypeError, ValueError):
-                raw = None
-            if raw is not None:
-                rc = self._rendering_control()
-                if rc is not None:
-                    scale = self._volume_scale(rc)
-                    self._volume = max(0, min(100, round(raw / scale * 100)))
-                elif 0 <= raw <= 100:
-                    # RC not resolvable yet; only trust an already-percent value.
-                    self._volume = raw
-
-        # Did the renderer actually reach a playing state for this track? A
-        # transient STOPPED/NO_MEDIA_PRESENT during the initial buffering window
-        # must NOT be mistaken for track-end (it would skip track 1 or tear down
-        # a single-track session before it ever played).
-        played = (self._transport_state or "").upper() in _TRANSPORT_OK
-
+        # Did the renderer actually reach a playing state *before* this event?
+        # A transient STOPPED/NO_MEDIA during the initial buffering window must
+        # NOT be mistaken for track-end (it would skip track 1 or tear down a
+        # single-track session). Computed from the PRIOR state, then advance the
+        # mirror — exactly as the original did before updating _transport_state.
+        played = (self._prev_transport_state or "").upper() in TRANSPORT_OK
         if transport_state:
-            self._transport_state = transport_state
+            self._prev_transport_state = transport_state
 
-        logger.debug(
-            f"[{self.renderer.name}] Event: state={transport_state}, uri={current_uri}"
-        )
-
-        # Detect gapless transition: renderer switched to preloaded track
+        # Detect gapless transition: renderer switched to the preloaded track.
         if current_uri and self._preloaded_index is not None:
             preloaded_track = self.tracks[self._preloaded_index]
             if current_uri == preloaded_track.url:
@@ -303,20 +245,17 @@ class QueueSession:
                 asyncio.create_task(self._preload_next())
                 return
 
-        # Detect track end for renderers WITHOUT SetNext support:
-        # When transport stops AFTER having played, and we have more tracks,
-        # auto-advance. _advancing dedupes duplicate STOPPED events that would
-        # otherwise fire a second advance and skip a track.
+        # Track end for renderers WITHOUT SetNext: when transport stops AFTER
+        # having played and more tracks remain, auto-advance. _advancing dedupes
+        # duplicate STOPPED events that would otherwise skip a track.
         if (
             transport_state == "STOPPED"
             and played
-            and not self.renderer.supports_next
+            and not self.backend.supports_next
             and self.current_index < len(self.tracks) - 1
             and not self._advancing
         ):
-            logger.info(
-                f"[{self.renderer.name}] Track ended (no gapless), advancing..."
-            )
+            logger.info(f"[{self.renderer.name}] Track ended (no gapless), advancing...")
             self._advancing = True
             asyncio.create_task(self._auto_advance())
             return
@@ -339,11 +278,10 @@ class QueueSession:
             self.current_index += 1
             self._preloaded_index = None
             track = self.tracks[self.current_index]
-            metadata = self._build_metadata(track)
             try:
-                assert self._dmr is not None
-                await self._dmr.async_set_transport_uri(track.url, track.title, metadata)
-                await self._dmr.async_play()
+                await self.backend.play_uri(
+                    track.url, track.title, self._build_metadata(track)
+                )
                 logger.info(
                     f"[{self.renderer.name}] Auto-advanced to track "
                     f"{self.current_index + 1}/{len(self.tracks)}: {track.title}"
@@ -351,23 +289,21 @@ class QueueSession:
             except Exception as e:
                 logger.error(f"[{self.renderer.name}] Auto-advance failed: {e}")
         finally:
-            # Re-arm for the next track's STOPPED. The `played` gate prevents a
-            # premature re-advance until the new track actually reaches PLAYING.
+            # Re-arm for the next track's STOPPED. The played gate (prior state
+            # must have been OK) prevents a premature re-advance until the new
+            # track actually reaches PLAYING.
             self._advancing = False
 
     async def _preload_next(self) -> None:
         """Preload the next track via SetNextAVTransportURI."""
         next_idx = self.current_index + 1
-        if next_idx >= len(self.tracks) or not self.renderer.supports_next:
-            return
-        if self._dmr is None:
+        if next_idx >= len(self.tracks) or not self.backend.supports_next:
             return
 
         track = self.tracks[next_idx]
-        metadata = self._build_metadata(track)
         try:
-            await self._dmr.async_set_next_transport_uri(
-                track.url, track.title, metadata
+            await self.backend.preload_next(
+                track.url, track.title, self._build_metadata(track)
             )
             self._preloaded_index = next_idx
             logger.debug(
@@ -381,13 +317,15 @@ class QueueSession:
         """Skip to next track immediately."""
         if self.current_index + 1 >= len(self.tracks):
             return None
+        if self.backend.owns_queue:
+            if not await self.backend.go_next():
+                return None
+            self.current_index += 1
+            return self.tracks[self.current_index]
         self.current_index += 1
         self._preloaded_index = None
         track = self.tracks[self.current_index]
-        metadata = self._build_metadata(track)
-        assert self._dmr is not None
-        await self._dmr.async_set_transport_uri(track.url, track.title, metadata)
-        await self._dmr.async_play()
+        await self.backend.play_uri(track.url, track.title, self._build_metadata(track))
         await self._preload_next()
         logger.info(
             f"[{self.renderer.name}] Skipped to track "
@@ -399,13 +337,15 @@ class QueueSession:
         """Go to previous track."""
         if self.current_index <= 0:
             return None
+        if self.backend.owns_queue:
+            if not await self.backend.go_previous():
+                return None
+            self.current_index -= 1
+            return self.tracks[self.current_index]
         self.current_index -= 1
         self._preloaded_index = None
         track = self.tracks[self.current_index]
-        metadata = self._build_metadata(track)
-        assert self._dmr is not None
-        await self._dmr.async_set_transport_uri(track.url, track.title, metadata)
-        await self._dmr.async_play()
+        await self.backend.play_uri(track.url, track.title, self._build_metadata(track))
         await self._preload_next()
         logger.info(
             f"[{self.renderer.name}] Back to track "
@@ -415,148 +355,72 @@ class QueueSession:
 
     async def stop(self) -> None:
         """Stop playback, unsubscribe, cleanup."""
-        if self._dmr:
-            try:
-                await self._dmr.async_stop()
-            except Exception as e:
-                logger.debug(f"[{self.renderer.name}] Stop failed: {e}")
-            try:
-                await self._dmr.async_unsubscribe_services()
-            except Exception as e:
-                logger.debug(f"[{self.renderer.name}] Unsubscribe failed: {e}")
+        await self.backend.disconnect()
         logger.info(f"[{self.renderer.name}] Stopped and cleaned up")
         await self._cleanup()
 
     async def pause(self) -> None:
         """Pause playback."""
-        if self._dmr is None:
-            raise RuntimeError("No active playback session")
-        await self._dmr.async_pause()
+        await self.backend.pause()
 
     async def resume(self) -> None:
         """Resume playback."""
-        if self._dmr is None:
-            raise RuntimeError("No active playback session")
-        await self._dmr.async_play()
-
-    # Volume/mute go through the RenderingControl service DIRECTLY (raw 0-100
-    # SetVolume/GetVolume/SetMute/GetMute), NOT async_upnp_client's DmrDevice
-    # helpers. DmrDevice normalises by the advertised volume range, and some
-    # renderers (Linn) advertise a bogus max (2^31-1) — async_set_volume_level
-    # would then send ~858M for "40%" and the renderer clamps to its real max
-    # = full-blast. DmrDevice.volume_level / has_volume_mute also read as
-    # None/False on those renderers even though the RC actions work fine.
-    def _rendering_control(self):
-        """The RenderingControl service for direct action calls, or None."""
-        if self._dmr is None:
-            return None
-        return self._dmr.device.services.get(_RENDERING_CONTROL_TYPE)
-
-    @staticmethod
-    def _volume_scale(rc) -> int:
-        """Renderer's RC volume max. Honours a sane advertised range, else 100.
-
-        Linn advertises 0..2147483647 (no real range) — treated as 0-100, the
-        scale its CurrentVolume actually uses.
-        """
-        try:
-            mx = rc.action("SetVolume").argument("DesiredVolume").related_state_variable.max_value
-            if mx and 2 <= int(mx) <= 1000:
-                return int(mx)
-        except Exception:  # noqa: BLE001 - missing/odd range -> safe default
-            pass
-        return 100
+        await self.backend.play()
 
     async def set_volume(self, volume: int) -> None:
-        """Set playback volume (0-100) via direct RC SetVolume."""
-        if self._dmr is None:
-            raise RuntimeError("No active playback session")
-        rc = self._rendering_control()
-        if rc is None or "SetVolume" not in rc.actions:
-            raise RuntimeError("Renderer does not support volume control")
-        pct = max(0, min(100, volume))
-        scale = self._volume_scale(rc)
-        desired = max(0, min(scale, round(pct / 100 * scale)))
-        await rc.action("SetVolume").async_call(
-            InstanceID=0, Channel="Master", DesiredVolume=desired
-        )
-        # Reflect our own write in the cache (in percent) so get_volume stays
-        # consistent without waiting for the renderer's echoed Volume event.
-        self._volume = pct
+        """Set playback volume (0-100)."""
+        await self.backend.set_volume(volume)
 
     async def set_mute(self, mute: bool) -> None:
-        """Mute (True) or unmute (False) via direct RC SetMute.
-
-        Mute is tracked independently of the volume level, so unmute restores
-        the prior volume without us storing it. Capability is detected by the
-        SetMute action being present (NOT DmrDevice.has_volume_mute, which reads
-        False on renderers whose GetMute the DmrDevice abstraction can't parse).
-        """
-        if self._dmr is None:
-            raise RuntimeError("No active playback session")
-        rc = self._rendering_control()
-        if rc is None or "SetMute" not in rc.actions:
-            raise RuntimeError("Renderer does not support mute")
-        await rc.action("SetMute").async_call(
-            InstanceID=0, Channel="Master", DesiredMute=mute
-        )
+        """Mute (True) or unmute (False)."""
+        await self.backend.set_mute(mute)
 
     async def get_volume(self) -> int | None:
-        """Current volume (0-100), or None if the renderer can't report it.
+        """Current volume (0-100), or None if unreportable."""
+        return await self.backend.get_volume()
 
-        Prefers the cached value maintained by _on_event / set_volume (no SOAP
-        round-trip). Falls back to a bounded direct RC GetVolume read.
-        """
-        if self._volume is not None:
-            return self._volume
-        rc = self._rendering_control()
-        if rc is None or "GetVolume" not in rc.actions:
-            return None
-        try:
-            res = await asyncio.wait_for(
-                rc.action("GetVolume").async_call(InstanceID=0, Channel="Master"),
-                timeout=_TRANSPORT_POLL_TIMEOUT,
-            )
-        except Exception:  # noqa: BLE001 - read is best-effort, mirror _query_transport_state
-            return None
-        cur = res.get("CurrentVolume")
-        if cur is None:
-            return None
-        scale = self._volume_scale(rc)
-        vol = max(0, min(100, round(int(cur) / scale * 100)))
-        # A Volume event may have landed via _on_event while the read ran;
-        # that value is fresher, so don't clobber it.
-        if self._volume is None:
-            self._volume = vol
-        return vol
+    async def get_mute(self) -> bool | None:
+        """Current mute state, or None if unreportable."""
+        return await self.backend.get_mute()
+
+    async def seek(self, position_seconds: int) -> None:
+        """Seek to a position (seconds) within the current track."""
+        await self.backend.seek(position_seconds)
+
+    async def set_play_mode(self, mode: str) -> None:
+        """Set the play mode (normal/repeat_one/repeat_all/shuffle/random)."""
+        await self.backend.set_play_mode(mode)
 
     async def _cleanup(self) -> None:
-        """Remove session from registry, shutdown infra if last."""
-        udn = self.renderer.udn
-        if udn in _sessions:
-            del _sessions[udn]
-        if not _sessions:
-            await _shutdown_infrastructure()
+        """Remove session from the control point (which shuts the shared infra
+        down when the last session leaves)."""
+        await self.control_point.unregister(self.renderer.udn)
 
     def _playback_state(self) -> str:
         """Map the renderer's last reported TransportState to a status string.
 
         Reports what the renderer actually says — never "playing" merely
-        because a renderer is bound (the old behavior, which lied when the
+        because a backend is bound (the old behavior, which lied when the
         stream failed).
         """
-        if self._dmr is None:
+        if not self.backend.connected:
             return "stopped"
-        state = (self._transport_state or "").upper()
-        if state in _TRANSPORT_OK:
+        state = (self.backend.transport_state or "").upper()
+        if state in TRANSPORT_OK:
             return "paused" if state == "PAUSED_PLAYBACK" else "playing"
-        if state in _TRANSPORT_DEAD:
+        if state in TRANSPORT_DEAD:
             return "stopped"
         # Transitioning / not yet reported — say so, don't claim "playing".
         return state.lower() if state else "unknown"
 
     def status(self) -> dict:
-        """Return current playback status."""
+        """Return current playback status.
+
+        position/duration/capabilities reflect whatever the backend last
+        polled — get_status calls refresh_state() first so they're fresh on
+        event-silent renderers. Keys are always present (None/empty when the
+        renderer can't report them) so the shape is stable for the client.
+        """
         track = self.tracks[self.current_index] if self.tracks else None
         return {
             "renderer": self.renderer.name,
@@ -566,37 +430,50 @@ class QueueSession:
             "title": track.title if track else None,
             "artist": track.artist if track else None,
             "album": track.album if track else None,
+            "position": self.backend.media_position,
+            "duration": self.backend.media_duration,
+            "capabilities": self.backend.capabilities,
+            "valid_play_modes": sorted(self.backend.valid_play_modes),
         }
 
 
-async def play_tracks(renderer: DlnaRenderer, tracks: list[Track]) -> QueueSession:
+async def play_tracks(
+    renderer: DlnaRenderer,
+    tracks: list[Track],
+    control_point: ControlPoint | None = None,
+) -> QueueSession:
     """Create and start a new queue session, replacing any existing one."""
-    # Stop existing session on this renderer
-    existing = _sessions.get(renderer.udn)
-    if existing:
-        await existing.stop()
+    cp = control_point or _default_control_point
 
-    session = QueueSession(renderer, tracks)
-    _sessions[renderer.udn] = session
-    try:
-        await session.start()
-    except Exception:
-        # start() failed (e.g. the renderer never began playback) — don't leave
-        # a dead session registered claiming a renderer.
-        _sessions.pop(renderer.udn, None)
+    # Serialise the stop-old/start-new swap so two concurrent play requests on
+    # the same renderer can't both register a session / race the infra. The lock
+    # is acquired only here (start()/stop() don't take it), so no reentrancy.
+    async with cp.lock_for(renderer.udn):
+        existing = cp.get_session(renderer.udn)
+        if existing:
+            await existing.stop()
+
+        session = QueueSession(renderer, tracks, control_point=cp)
+        cp.register(renderer.udn, session)
         try:
-            await session.stop()
+            await session.start()
         except Exception:
-            pass
-        raise
-    return session
+            # start() failed (e.g. the renderer never began playback) — don't
+            # leave a dead session registered claiming a renderer.
+            cp.sessions.pop(renderer.udn, None)
+            try:
+                await session.stop()
+            except Exception:
+                pass
+            raise
+        return session
 
 
 def get_session(udn: str) -> QueueSession | None:
-    """Get active session for a renderer."""
-    return _sessions.get(udn)
+    """Get active session for a renderer (from the default control point)."""
+    return _default_control_point.get_session(udn)  # type: ignore[return-value]
 
 
 def get_all_sessions() -> dict[str, QueueSession]:
-    """Get all active sessions."""
-    return dict(_sessions)
+    """Get all active sessions (from the default control point)."""
+    return _default_control_point.get_all_sessions()  # type: ignore[return-value]

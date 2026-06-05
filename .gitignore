@@ -4,3 +4,6 @@ __pycache__/
 dist/
 build/
 .pytest_cache/
+
+# Local QA artifacts (not part of the package)
+test-screenshots/
