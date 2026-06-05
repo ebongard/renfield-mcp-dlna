@@ -356,6 +356,51 @@ class TestSetVolume:
             assert result["volume"] == 0
 
 
+class TestGetVolume:
+    async def test_returns_cached_volume(self):
+        renderer = _make_renderer()
+        mock_session = MagicMock(spec=QueueSession)
+        mock_session.get_volume = AsyncMock(return_value=42)
+        with (
+            patch.object(discovery, "find_renderer", new_callable=AsyncMock, return_value=renderer),
+            patch.object(queue_manager, "get_session", return_value=mock_session),
+        ):
+            result = await server.get_volume("HiFiBerry")
+            assert result.get("success") is True
+            assert result["volume"] == 42
+            mock_session.get_volume.assert_awaited_once_with()
+
+    async def test_volume_none_when_unreportable(self):
+        renderer = _make_renderer()
+        mock_session = MagicMock(spec=QueueSession)
+        mock_session.get_volume = AsyncMock(return_value=None)
+        with (
+            patch.object(discovery, "find_renderer", new_callable=AsyncMock, return_value=renderer),
+            patch.object(queue_manager, "get_session", return_value=mock_session),
+        ):
+            result = await server.get_volume("HiFiBerry")
+            assert result.get("success") is True
+            assert result["volume"] is None
+
+    async def test_no_active_session(self):
+        renderer = _make_renderer()
+        with (
+            patch.object(discovery, "find_renderer", new_callable=AsyncMock, return_value=renderer),
+            patch.object(queue_manager, "get_session", return_value=None),
+        ):
+            result = await server.get_volume("HiFiBerry")
+            assert result.get("success") is False
+            assert "No active playback" in result["error"]
+
+    async def test_renderer_not_found(self):
+        with patch.object(
+            discovery, "find_renderer", new_callable=AsyncMock, return_value=None
+        ):
+            result = await server.get_volume("Unknown")
+            assert result.get("success") is False
+            assert "not found" in result["error"]
+
+
 # ---------------------------------------------------------------------------
 # QueueSession Unit Tests
 # ---------------------------------------------------------------------------
@@ -687,6 +732,64 @@ class TestOnEvent:
         s._transport_state = "PLAYING"
         s._on_event(MagicMock(), [_SV("Volume", 28), _SV("Mute", False)])
         assert s._transport_state == "PLAYING"  # untouched by unrelated vars
+
+
+class TestVolumeCache:
+    """get_volume reads a cached value (kept fresh by _on_event / set_volume)
+    and only round-trips to the renderer via async_update when the cache is
+    empty."""
+
+    def test_on_event_caches_volume(self):
+        s = QueueSession(_make_renderer(), _make_tracks(1))
+        s._dmr = MagicMock()
+        s._on_event(MagicMock(), [_SV("Volume", 28)])
+        assert s._volume == 28
+
+    def test_on_event_bad_volume_ignored(self):
+        s = QueueSession(_make_renderer(), _make_tracks(1))
+        s._dmr = MagicMock()
+        s._on_event(MagicMock(), [_SV("Volume", "not-a-number")])
+        assert s._volume is None
+
+    async def test_set_volume_updates_cache(self):
+        s = QueueSession(_make_renderer(), _make_tracks(1))
+        s._dmr = MagicMock()
+        s._dmr.async_set_volume_level = AsyncMock()
+        await s.set_volume(55)
+        assert s._volume == 55
+        s._dmr.async_set_volume_level.assert_awaited_once_with(0.55)
+
+    async def test_get_volume_returns_cache_without_polling(self):
+        s = QueueSession(_make_renderer(), _make_tracks(1))
+        s._dmr = MagicMock()
+        s._dmr.async_update = AsyncMock()
+        s._volume = 33
+        vol = await s.get_volume()
+        assert vol == 33
+        s._dmr.async_update.assert_not_awaited()
+
+    async def test_get_volume_falls_back_to_async_update(self):
+        s = QueueSession(_make_renderer(), _make_tracks(1))
+        s._dmr = MagicMock()
+        s._dmr.async_update = AsyncMock()
+        s._dmr.volume_level = 0.4  # renderer reports 0.0-1.0
+        assert s._volume is None
+        vol = await s.get_volume()
+        assert vol == 40
+        s._dmr.async_update.assert_awaited_once()
+        assert s._volume == 40  # now cached
+
+    async def test_get_volume_none_when_cache_empty_and_level_none(self):
+        s = QueueSession(_make_renderer(), _make_tracks(1))
+        s._dmr = MagicMock()
+        s._dmr.async_update = AsyncMock()
+        s._dmr.volume_level = None
+        assert await s.get_volume() is None
+
+    async def test_get_volume_none_when_no_dmr(self):
+        s = QueueSession(_make_renderer(), _make_tracks(1))
+        assert s._dmr is None
+        assert await s.get_volume() is None
 
 
 class TestStopEventGuards:
