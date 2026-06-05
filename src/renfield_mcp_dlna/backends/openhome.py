@@ -11,11 +11,15 @@ alongside) standard UPnP AVTransport/RenderingControl:
     on Linn, whose RenderingControl advertises a bogus max (the workaround the
     AVTransport backend needs); the OpenHome Volume service reports a real max.
 
-PROVISIONAL — validated only against the OpenHome service spec + mocks, NOT a
-real Linn yet (see tasks/todo.md T4/T10). It is therefore NOT auto-selected:
-the factory routes OpenHome renderers here only when RENFIELD_OPENHOME=1, so an
-unvalidated path can't regress Linn playback that currently works via the
-AVTransport fallback. Enable it to run the spike against real hardware.
+Validation status (against real Linn Majik/Sneaky DSM hardware):
+  * Sibling-device discovery (host-correlated openhome_location), version-flexible
+    service resolution (Volume:4), and volume/mute reads — VERIFIED (the OpenHome
+    volume matched the AVTransport RenderingControl reading).
+  * The PLAYBACK path (load_queue → Insert/SeekId/Play, go_next/go_previous) is
+    still UNVERIFIED — no audio has actually been played through it.
+Because playback is unproven, the factory still routes OpenHome renderers here
+only when RENFIELD_OPENHOME=1, so it can't regress Linn playback via AVTransport.
+Enable it to validate the playlist path against hardware.
 """
 
 import logging
@@ -28,8 +32,9 @@ from .base import PlaybackBackend, TransportEvent
 
 logger = logging.getLogger(__name__)
 
-_PLAYLIST_TYPE = "urn:av-openhome-org:service:Playlist:1"
-_VOLUME_TYPE = "urn:av-openhome-org:service:Volume:1"
+# Version-flexible prefixes — real Linn advertises Playlist:1, Volume:4, etc.
+_PLAYLIST_PREFIX = "urn:av-openhome-org:service:Playlist:"
+_VOLUME_PREFIX = "urn:av-openhome-org:service:Volume:"
 
 
 class OpenHomeBackend(PlaybackBackend):
@@ -63,13 +68,17 @@ class OpenHomeBackend(PlaybackBackend):
 
     # -- services ----------------------------------------------------------
 
-    def _service(self, service_type: str):
+    def _service(self, type_prefix: str):
+        """Find a service whose type starts with `type_prefix` (version-flexible)."""
         if self._device is None:
             return None
-        return self._device.services.get(service_type)
+        for service_type, svc in self._device.services.items():
+            if service_type.startswith(type_prefix):
+                return svc
+        return None
 
     def _playlist(self):
-        svc = self._service(_PLAYLIST_TYPE)
+        svc = self._service(_PLAYLIST_PREFIX)
         if svc is None:
             raise RuntimeError("OpenHome renderer has no Playlist service")
         return svc
@@ -84,7 +93,10 @@ class OpenHomeBackend(PlaybackBackend):
         event_handler: UpnpEventHandler,
     ) -> None:
         self._on_event = on_event
-        self._device = await factory.async_create_device(self.renderer.location)
+        # OpenHome services live on the sibling device (Linn), not the renderer's
+        # MediaRenderer description — use the correlated openhome_location.
+        location = self.renderer.openhome_location or self.renderer.location
+        self._device = await factory.async_create_device(location)
 
     async def disconnect(self) -> None:
         if self._device is None:
@@ -171,7 +183,7 @@ class OpenHomeBackend(PlaybackBackend):
     # -- volume / mute (OpenHome Volume service) ---------------------------
 
     def _volume_service(self):
-        return self._service(_VOLUME_TYPE)
+        return self._service(_VOLUME_PREFIX)
 
     async def _volume_max(self, vol) -> int:
         try:

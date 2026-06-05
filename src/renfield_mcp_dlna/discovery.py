@@ -6,6 +6,7 @@ import socket
 import struct
 import time
 from dataclasses import dataclass
+from urllib.parse import urlparse
 
 import aiohttp
 
@@ -32,7 +33,9 @@ _SEARCH_TARGET = "urn:schemas-upnp-org:device:MediaRenderer:1"
 CACHE_TTL = 300  # 5 minutes
 
 
-_OPENHOME_PLAYLIST_TYPE = "urn:av-openhome-org:service:Playlist:1"
+# Version-flexible: real Linn advertises Playlist:1 / Volume:4 etc. Match the
+# service-type prefix, not an exact version.
+_OPENHOME_PLAYLIST_PREFIX = "urn:av-openhome-org:service:Playlist:"
 
 
 @dataclass
@@ -55,6 +58,11 @@ class DlnaRenderer:
     model_name: str = ""
     is_openhome: bool = False
     is_sonos: bool = False
+    # OpenHome renderers (Linn) expose their av-openhome-org services on a
+    # SEPARATE root device (urn:linn-co-uk:device:Source:1) with a different UDN
+    # but the same host. When discovery finds that sibling, this points at its
+    # device description so OpenHomeBackend can build from it.
+    openhome_location: str = ""
 
 
 _renderer_cache: list[DlnaRenderer] = []
@@ -294,8 +302,10 @@ async def _fetch_device_description(
             )
         elif service_type == _RENDERING_CONTROL_TYPE:
             rc_control_url = control_url or ""
-        elif service_type == _OPENHOME_PLAYLIST_TYPE:
-            # OpenHome renderer (Linn et al.): owns the queue device-side.
+        elif service_type.startswith(_OPENHOME_PLAYLIST_PREFIX):
+            # OpenHome services on the renderer's OWN description (some devices
+            # combine them); Linn instead puts them on a sibling device, handled
+            # by the host-correlation pass in discover_renderers.
             is_openhome = True
 
     if not av_control_url:
@@ -353,6 +363,41 @@ async def _check_set_next_support(
     return False
 
 
+async def _fetch_openhome_location(
+    session: aiohttp.ClientSession, location: str
+) -> tuple[str, str] | None:
+    """If `location` describes an OpenHome device (advertises an av-openhome-org
+    Playlist service), return (host, location); else None.
+
+    Real Linn renderers expose OpenHome on a SEPARATE root device (e.g.
+    urn:linn-co-uk:device:Source:1) from the standard MediaRenderer, so this is
+    correlated back to the renderer by host in discover_renderers.
+    """
+    try:
+        async with session.get(location, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+            if resp.status != 200:
+                return None
+            xml_text = await resp.text()
+    except Exception:
+        return None
+    try:
+        root = ET.fromstring(xml_text)
+    except (ET.ParseError, DefusedXmlException):
+        return None
+    device = root.find(f"{{{_NS_DEVICE}}}device")
+    if device is None:
+        return None
+    service_list = device.find(f"{{{_NS_DEVICE}}}serviceList")
+    if service_list is None:
+        return None
+    for service in service_list.findall(f"{{{_NS_DEVICE}}}service"):
+        st = service.findtext(f"{{{_NS_DEVICE}}}serviceType", "")
+        if st.startswith(_OPENHOME_PLAYLIST_PREFIX):
+            host = urlparse(location).hostname or ""
+            return (host, location)
+    return None
+
+
 async def discover_renderers(force: bool = False) -> list[DlnaRenderer]:
     """Discover DLNA MediaRenderers on the network.
 
@@ -369,20 +414,43 @@ async def discover_renderers(force: bool = False) -> list[DlnaRenderer]:
 
     renderers: list[DlnaRenderer] = []
     async with aiohttp.ClientSession() as session:
-        tasks = [_fetch_device_description(session, loc) for loc in locations]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
+        results = await asyncio.gather(
+            *(_fetch_device_description(session, loc) for loc in locations),
+            return_exceptions=True,
+        )
         for result in results:
             if isinstance(result, DlnaRenderer):
                 renderers.append(result)
             elif isinstance(result, Exception):
                 logger.debug(f"Device description fetch failed: {result}")
 
+        # Correlate OpenHome sibling devices (separate root device, same host)
+        # back onto their renderer, so Linn et al. are flagged is_openhome with
+        # a pointer to the OpenHome device description.
+        oh_results = await asyncio.gather(
+            *(_fetch_openhome_location(session, loc) for loc in locations),
+            return_exceptions=True,
+        )
+        oh_by_host: dict[str, str] = {}
+        for oh in oh_results:
+            if isinstance(oh, tuple):
+                host, oh_loc = oh
+                oh_by_host.setdefault(host, oh_loc)
+
+    for r in renderers:
+        host = urlparse(r.location).hostname or ""
+        if host in oh_by_host:
+            r.is_openhome = True
+            r.openhome_location = oh_by_host[host]
+
     _renderer_cache = renderers
     _cache_time = time.time()
     logger.info(
         f"Discovered {len(renderers)} renderer(s): "
-        + ", ".join(f"{r.name} (next={r.supports_next})" for r in renderers)
+        + ", ".join(
+            f"{r.name} (next={r.supports_next}, openhome={r.is_openhome})"
+            for r in renderers
+        )
     )
     return renderers
 

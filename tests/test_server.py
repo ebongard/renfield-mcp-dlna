@@ -2057,3 +2057,88 @@ class TestMultiInterfaceSearch:
         monkeypatch.setattr(discovery, "_local_ipv4_addresses", lambda: ["10.0.0.5"])
         # The default-route legs still succeed despite the interface leg raising.
         assert await discovery._ssdp_search(timeout=0.01) == ["http://default/d.xml"]
+
+
+# ---------------------------------------------------------------------------
+# OpenHome sibling-device discovery (validated against real Linn hardware)
+# ---------------------------------------------------------------------------
+
+class TestOpenHomeSiblingDiscovery:
+    _OH_DESC = """<?xml version="1.0"?>
+<root xmlns="urn:schemas-upnp-org:device-1-0"><device>
+  <deviceType>urn:linn-co-uk:device:Source:1</deviceType>
+  <friendlyName>Linn</friendlyName><UDN>uuid:oh</UDN>
+  <serviceList>
+    <service><serviceType>urn:av-openhome-org:service:Volume:4</serviceType>
+      <controlURL>/v</controlURL></service>
+    <service><serviceType>urn:av-openhome-org:service:Playlist:1</serviceType>
+      <controlURL>/p</controlURL></service>
+  </serviceList></device></root>"""
+
+    async def test_fetch_openhome_location_detects_playlist(self):
+        out = await discovery._fetch_openhome_location(
+            _desc_session(self._OH_DESC), "http://10.0.0.9:55178/oh/device.xml"
+        )
+        assert out == ("10.0.0.9", "http://10.0.0.9:55178/oh/device.xml")
+
+    async def test_non_openhome_device_returns_none(self):
+        xml = _DESC_TMPL.format(name="Plain", mfr="X", model="Y", extra_service="")
+        assert await discovery._fetch_openhome_location(
+            _desc_session(xml), "http://10.0.0.9/d.xml"
+        ) is None
+
+    async def test_sibling_correlated_onto_renderer_by_host(self, monkeypatch):
+        # The Linn topology: MediaRenderer + separate OpenHome Source device,
+        # same host, different UDN. discover_renderers must flag is_openhome and
+        # point openhome_location at the sibling.
+        r = _make_renderer(name="Linn", udn="uuid:r")
+        r.location = "http://10.0.0.9:55178/r/device.xml"
+        r.is_openhome = False
+
+        async def _fake_fetch(session, loc):
+            return r if loc == "loc-r" else None
+
+        async def _fake_oh(session, loc):
+            if loc == "loc-oh":
+                return ("10.0.0.9", "http://10.0.0.9:55178/oh/device.xml")
+            return None
+
+        monkeypatch.setattr(discovery, "_ssdp_search",
+                            AsyncMock(return_value=["loc-r", "loc-oh"]))
+        monkeypatch.setattr(discovery, "_fetch_device_description", _fake_fetch)
+        monkeypatch.setattr(discovery, "_fetch_openhome_location", _fake_oh)
+        discovery._renderer_cache = []
+        discovery._cache_time = 0
+        out = await discovery.discover_renderers(force=True)
+        assert out[0].is_openhome is True
+        assert out[0].openhome_location == "http://10.0.0.9:55178/oh/device.xml"
+        discovery._renderer_cache = []
+        discovery._cache_time = 0
+
+
+class TestOpenHomeVersionFlexibleServices:
+    async def test_volume_service_matched_by_prefix(self):
+        # Real Linn exposes Volume:4, not Volume:1 — prefix match must find it.
+        b = OpenHomeBackend(_make_renderer())
+        _, calls = _mock_openhome_device()
+        # Re-key the volume service under Volume:4 to mimic real hardware.
+        dev = MagicMock()
+        plain, calls = _mock_openhome_device(cur_volume=72)
+        dev.services = {
+            "urn:av-openhome-org:service:Playlist:1": plain.services[_OH_PLAYLIST],
+            "urn:av-openhome-org:service:Volume:4": plain.services[_OH_VOLUME],
+        }
+        b._device = dev
+        assert b._service("urn:av-openhome-org:service:Volume:") is not None
+        assert await b.get_volume() == 72
+
+    async def test_connect_uses_openhome_location(self, monkeypatch):
+        r = _make_renderer()
+        r.openhome_location = "http://10.0.0.9:55178/oh/device.xml"
+        factory = MagicMock()
+        factory.async_create_device = AsyncMock(return_value=MagicMock())
+        b = OpenHomeBackend(r)
+        await b.connect(lambda *a: None, factory=factory, event_handler=MagicMock())
+        factory.async_create_device.assert_awaited_once_with(
+            "http://10.0.0.9:55178/oh/device.xml"
+        )
