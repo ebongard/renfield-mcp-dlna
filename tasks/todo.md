@@ -9,7 +9,31 @@ Confirmed scope: renderers + MediaServers; device classes OpenHome (Linn), DLNA 
 (Samsung/LG/Sony), standard AVTransport (HiFiBerry/Kodi/VLC), Sonos; IPv4 multi-interface
 live-cache discovery.
 
-## Progress (branch `feat/upnp-control-point-phase1`, 148 tests green)
+## Progress (branch `feat/upnp-control-point-phase1`, 183 tests green)
+
+**Update 3 — device classes + discovery + metadata implemented (mock-verified, hardware-validation pending):**
+- ✅ **T8/T7** metadata strategy: `metadata.py` (family-aware protocolInfo, caller hints, memoize).
+  PROVISIONAL DLNA flag/PN values — need real Samsung/LG/Sony.
+- ✅ **T10** `OpenHomeBackend` (device-owned queue via av-openhome-org Playlist/Volume). Env-gated
+  `RENFIELD_OPENHOME=1`, PROVISIONAL (no real Linn). ABC gained `load_queue`/`go_next`/`go_previous`.
+- ✅ **T11** `SonosBackend` wrapping `soco` (optional dep `.[sonos]`). Env-gated `RENFIELD_SONOS=1`,
+  PROVISIONAL (no real Sonos).
+- ✅ **T1 (partial)** additive multi-interface M-SEARCH (ifaddr; default-route path unchanged).
+- ✅ **T12 (partial)** per-UDN play lock (done in update 2).
+
+**Genuinely remaining — deliberately NOT implemented blind (net-negative without hardware):**
+- **T1 passive SSDP listener** (alive/byebye live cache) — rewrites the working discovery-receive
+  loop; mock tests can't validate real multicast behaviour.
+- **T12 autonomous NOTIFY/GENA watchdog** — would interfere with the carefully-tuned event-reaction
+  logic (the area the code review already caught a regression in); the library already does
+  `auto_resubscribe` and `get_status` refreshes on demand. Real recovery needs a long-lived device
+  + reboot to validate.
+- **Validation pass**: run the env-gated OpenHome/Sonos backends + TV metadata + multi-interface
+  discovery against real Linn/Samsung/Sonos/multi-NIC hosts, then promote from provisional.
+
+---
+
+### Update 2 progress note (148 tests)
 
 **Update 2:** also landed **T9 MediaServer** (list_servers/browse_server/search_server/
 play_from_server via DmsDevice — full control point), the **per-UDN play lock** (part of T12),

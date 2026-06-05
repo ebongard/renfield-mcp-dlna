@@ -51,16 +51,28 @@ Source modules under `src/renfield_mcp_dlna/`, layered:
   `ensure_started()` closes the lazy-init race with a double-checked lock;
   `unregister()` tears the infra down when the last session leaves. This is the
   intended home for the SSDP listener + device registry (later phases).
-- **`backends/`** — `PlaybackBackend` ABC (`base.py`) + `AvTransportBackend`
-  (`avtransport.py`). The backend owns **all device I/O**: the `DmrDevice`,
-  RenderingControl volume/mute, transport-state polling, and raw `LAST_CHANGE`
-  parsing. The ABC is deliberately small and **provisional** until the OpenHome
-  spike proves the device-owned-queue shape (`owns_queue` seam).
-- **`queue_manager.py`** — `QueueSession` owns the queue (track list + index)
-  and the gapless/auto-advance event *reaction*, delegating device I/O to its
-  `backend`. `_make_backend()` is the factory (today always AVTransport; OpenHome
-  /Sonos slot in by identity). A module `_default_control_point` backs the
-  `play_tracks`/`get_session` facade.
+- **`backends/`** — `PlaybackBackend` ABC (`base.py`) + three impls. The backend
+  owns **all device I/O**. `AvTransportBackend` (default, client-owned queue:
+  `DmrDevice`, RenderingControl volume/mute, polling, raw `LAST_CHANGE` parsing).
+  `OpenHomeBackend` and `SonosBackend` are **`owns_queue=True`** (device holds the
+  queue): they implement `load_queue`/`go_next`/`go_previous` and QueueSession
+  hands the whole queue over once. Both are **PROVISIONAL** (mock+spec only, no
+  real device yet) and env-gated: `RENFIELD_OPENHOME=1` / `RENFIELD_SONOS=1`
+  (else OpenHome/Sonos renderers use AVTransport). `soco` is an optional dep
+  (`pip install '.[sonos]'`).
+- **`metadata.py`** — device-family DIDL/protocolInfo strategy. Audio keeps the
+  `*` 4th-field (no regression); video adds DLNA.ORG_OP/FLAGS, TV families
+  (Samsung/LG/Sony) get a `DLNA.ORG_PN` seam. Caller `mime_type`/`dlna_features`
+  hints win. **PROVISIONAL** flag values (need real-TV validation). `QueueSession`
+  memoises built metadata per URL.
+- **`mediaserver.py`** — `DmsDevice`-backed ContentDirectory browse/search +
+  `resolve_playables` (container → children, item → metadata). Powers the
+  `list_servers`/`browse_server`/`search_server`/`play_from_server` tools.
+- **`queue_manager.py`** — `QueueSession` owns the queue + the gapless/auto-
+  advance event *reaction* (client-owned-queue backends) or delegates to the
+  device (`owns_queue` backends), via its `backend`. `_make_backend()` is the
+  factory (selects by identity + env). A module `_default_control_point` backs
+  the `play_tracks`/`get_session` facade.
 
 ### Key behaviors that span files
 
