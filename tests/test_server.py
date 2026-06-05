@@ -44,6 +44,40 @@ def _make_tracks(count: int = 3) -> list[Track]:
     ]
 
 
+_RC_TYPE = "urn:schemas-upnp-org:service:RenderingControl:1"
+
+
+def _mock_dmr_with_rc(actions=("GetVolume", "SetVolume", "GetMute", "SetMute"),
+                      current_volume=None, scale_max=100):
+    """Build a mock _dmr exposing a RenderingControl service for direct-action
+    volume/mute. Records calls in the returned `calls` dict keyed by action name."""
+    calls: dict = {}
+    rc = MagicMock()
+    rc.actions = list(actions)
+
+    def _action(name):
+        act = MagicMock()
+
+        async def _call(**kw):
+            calls.setdefault(name, []).append(kw)
+            if name == "GetVolume":
+                return {"CurrentVolume": current_volume}
+            if name == "GetMute":
+                return {"CurrentMute": False}
+            return {}
+
+        act.async_call = AsyncMock(side_effect=_call)
+        sv = MagicMock()
+        sv.max_value = scale_max
+        act.argument.return_value.related_state_variable = sv
+        return act
+
+    rc.action.side_effect = _action
+    dmr = MagicMock()
+    dmr.device.services = {_RC_TYPE: rc}
+    return dmr, calls
+
+
 # ---------------------------------------------------------------------------
 # DIDL-Lite Tests
 # ---------------------------------------------------------------------------
@@ -799,66 +833,78 @@ class TestVolumeCache:
 
     def test_on_event_caches_volume(self):
         s = QueueSession(_make_renderer(), _make_tracks(1))
-        s._dmr = MagicMock()
+        s._dmr, _ = _mock_dmr_with_rc(scale_max=100)
         s._on_event(MagicMock(), [_SV("Volume", 28)])
         assert s._volume == 28
 
     def test_on_event_bad_volume_ignored(self):
         s = QueueSession(_make_renderer(), _make_tracks(1))
-        s._dmr = MagicMock()
+        s._dmr, _ = _mock_dmr_with_rc()
         s._on_event(MagicMock(), [_SV("Volume", "not-a-number")])
         assert s._volume is None
 
-    async def test_set_volume_updates_cache(self):
+    async def test_on_event_volume_normalized_to_percent_on_scaled_renderer(self):
+        """A Volume event on a 0-255 renderer must cache/return percent (50),
+        not the raw event value (128)."""
         s = QueueSession(_make_renderer(), _make_tracks(1))
-        s._dmr = MagicMock()
-        s._dmr.async_set_volume_level = AsyncMock()
+        s._dmr, calls = _mock_dmr_with_rc(scale_max=255)
+        s._on_event(MagicMock(), [_SV("Volume", 128)])
+        assert s._volume == 50
+        assert await s.get_volume() == 50
+        assert "GetVolume" not in calls  # served from the normalized cache
+
+    async def test_set_volume_direct_rc_raw_and_caches(self):
+        s = QueueSession(_make_renderer(), _make_tracks(1))
+        s._dmr, calls = _mock_dmr_with_rc(scale_max=100)
         await s.set_volume(55)
         assert s._volume == 55
-        s._dmr.async_set_volume_level.assert_awaited_once_with(0.55)
+        # raw 0-100 SetVolume (NOT a 0.0-1.0 fraction, NOT scaled by a bogus max)
+        assert calls["SetVolume"][0] == {"InstanceID": 0, "Channel": "Master", "DesiredVolume": 55}
 
-    async def test_set_mute_calls_dmr_when_supported(self):
+    async def test_set_volume_bogus_range_does_not_blast(self):
+        """Linn advertises max 2^31-1; we must treat it as 0-100, NOT send ~858M."""
         s = QueueSession(_make_renderer(), _make_tracks(1))
-        s._dmr = MagicMock()
-        s._dmr.has_volume_mute = True
-        s._dmr.async_mute_volume = AsyncMock()
+        s._dmr, calls = _mock_dmr_with_rc(scale_max=2147483647)
+        await s.set_volume(40)
+        assert calls["SetVolume"][0]["DesiredVolume"] == 40  # raw 40, not 858993459
+
+    async def test_set_volume_scales_when_range_is_sane_nonstandard(self):
+        s = QueueSession(_make_renderer(), _make_tracks(1))
+        s._dmr, calls = _mock_dmr_with_rc(scale_max=255)
+        await s.set_volume(100)
+        assert calls["SetVolume"][0]["DesiredVolume"] == 255  # 100% of a 0-255 range
+
+    async def test_set_mute_direct_rc_when_supported(self):
+        s = QueueSession(_make_renderer(), _make_tracks(1))
+        s._dmr, calls = _mock_dmr_with_rc()
         await s.set_mute(True)
-        s._dmr.async_mute_volume.assert_awaited_once_with(True)
+        assert calls["SetMute"][0] == {"InstanceID": 0, "Channel": "Master", "DesiredMute": True}
 
-    async def test_set_mute_clear_error_when_unsupported(self):
+    async def test_set_mute_clear_error_when_action_absent(self):
         s = QueueSession(_make_renderer(), _make_tracks(1))
-        s._dmr = MagicMock()
-        s._dmr.has_volume_mute = False
-        s._dmr.async_mute_volume = AsyncMock()
+        s._dmr, calls = _mock_dmr_with_rc(actions=("GetVolume", "SetVolume"))  # no SetMute
         with pytest.raises(RuntimeError, match="does not support mute"):
             await s.set_mute(True)
-        s._dmr.async_mute_volume.assert_not_awaited()
+        assert "SetMute" not in calls
 
     async def test_get_volume_returns_cache_without_polling(self):
         s = QueueSession(_make_renderer(), _make_tracks(1))
-        s._dmr = MagicMock()
-        s._dmr.async_update = AsyncMock()
+        s._dmr, calls = _mock_dmr_with_rc(current_volume=99)
         s._volume = 33
-        vol = await s.get_volume()
-        assert vol == 33
-        s._dmr.async_update.assert_not_awaited()
+        assert await s.get_volume() == 33
+        assert "GetVolume" not in calls  # cache hit, no RC read
 
-    async def test_get_volume_falls_back_to_async_update(self):
+    async def test_get_volume_falls_back_to_direct_rc(self):
         s = QueueSession(_make_renderer(), _make_tracks(1))
-        s._dmr = MagicMock()
-        s._dmr.async_update = AsyncMock()
-        s._dmr.volume_level = 0.4  # renderer reports 0.0-1.0
+        s._dmr, calls = _mock_dmr_with_rc(current_volume=40, scale_max=100)
         assert s._volume is None
-        vol = await s.get_volume()
-        assert vol == 40
-        s._dmr.async_update.assert_awaited_once()
+        assert await s.get_volume() == 40
+        assert "GetVolume" in calls
         assert s._volume == 40  # now cached
 
-    async def test_get_volume_none_when_cache_empty_and_level_none(self):
+    async def test_get_volume_none_when_rc_returns_none(self):
         s = QueueSession(_make_renderer(), _make_tracks(1))
-        s._dmr = MagicMock()
-        s._dmr.async_update = AsyncMock()
-        s._dmr.volume_level = None
+        s._dmr, calls = _mock_dmr_with_rc(current_volume=None)
         assert await s.get_volume() is None
 
     async def test_get_volume_none_when_no_dmr(self):
