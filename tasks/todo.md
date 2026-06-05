@@ -9,7 +9,33 @@ Confirmed scope: renderers + MediaServers; device classes OpenHome (Linn), DLNA 
 (Samsung/LG/Sony), standard AVTransport (HiFiBerry/Kodi/VLC), Sonos; IPv4 multi-interface
 live-cache discovery.
 
-## Progress (branch `feat/upnp-control-point-phase1`, 183 tests green)
+## LIVE VALIDATION (real network, run via scripts/validate_live.py)
+
+Ran against the real LAN — **7 renderers + Jellyfin** — all core functionality verified:
+
+- ✅ **Discovery**: 2× Samsung TV, 4× Linn (Majik/Sneaky DSM), HiFiBerryOS, + Jellyfin server.
+- ✅ **OpenHome bug found + fixed + verified**: real Linn exposes OpenHome on a SEPARATE root
+  device (`urn:linn-co-uk:device:Source:1`, UDN `…013f`) from the MediaRenderer (`…0171`), same
+  host. Added host-correlation → all 4 Linn now flagged OpenHome; OpenHomeBackend connects to the
+  sibling, resolves `Volume:4` (version-flexible), reads volume/mute **matching the AVTransport RC
+  value** (cross-validated). The combo-device warning, confirmed by hardware.
+- ✅ **Renderer reads** (connect, no playback): volume/mute/capabilities/play-modes/transport-state
+  read correctly from Samsung (caps all true), all 4 Linn (volumes 55/72/33/40, bogus-range
+  workaround holds), HiFiBerry (play_modes intro/normal/repeat_all).
+- ✅ **MediaServer**: Jellyfin browse root → Musik → Neueste → album drill-down; `resolve_playables`
+  on a real album returned **30 tracks with real stream URLs**; search returned 50,871 matches.
+- ✅ **END-TO-END PLAYBACK** (HiFiBerry, user-approved): play 2 Jellyfin tracks → confirmed PLAYING
+  → status track 1/2 → **position advanced 0→5s** → stop → session cleaned up.
+
+Live findings (minor): Samsung Flip WM55B returns HTTP 404 on its control path (device quirk,
+handled gracefully); HiFiBerryOS reported duration=0 at stream start (position worked).
+
+Still unproven on hardware: OpenHome *playback* (load_queue; volume/discovery done), Sonos (no unit
+on this LAN), TV video metadata, the passive SSDP listener + GENA watchdog (deliberately not built).
+
+---
+
+## Progress (branch `feat/upnp-control-point-phase1`, 188 tests green)
 
 **Update 3 — device classes + discovery + metadata implemented (mock-verified, hardware-validation pending):**
 - ✅ **T8/T7** metadata strategy: `metadata.py` (family-aware protocolInfo, caller hints, memoize).
