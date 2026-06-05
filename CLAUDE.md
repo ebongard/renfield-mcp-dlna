@@ -28,58 +28,78 @@ Requires Python >= 3.11.
 
 ## Architecture
 
-Three source modules under `src/renfield_mcp_dlna/`, layered:
+> Mid-refactor: an active plan in `tasks/todo.md` is migrating this toward a
+> full UPnP control point (renderers + MediaServers, per-device-class backends,
+> live discovery). Phase 1 landed the `PlaybackBackend` seam + `ControlPoint`;
+> later phases add OpenHome/Sonos backends, MediaServer browsing, and a
+> library-backed SSDP listener. Read `tasks/todo.md` before extending.
+
+Source modules under `src/renfield_mcp_dlna/`, layered:
 
 - **`server.py`** — thin FastMCP tool layer. Each `@mcp.tool()` resolves a
-  renderer by name, looks up its session, delegates to `queue_manager`, and
-  returns a `{"success": bool, ...}` dict. Tools never raise to the client;
-  they catch and return error dicts. `main()` selects transport from
-  `MCP_TRANSPORT`.
+  renderer/session via the `resolve_renderer`/`resolve_session` helpers (which
+  raise `ToolError`), delegates to `queue_manager`, and returns a
+  `{"success": bool, ...}` dict via `_error()`. Tools never raise to the client.
+  `main()` selects transport from `MCP_TRANSPORT`.
 - **`discovery.py`** — SSDP M-SEARCH (raw UDP multicast to
-  `239.255.255.250:1900`) + device-description XML parsing. Holds a 5-min
-  module-level renderer cache. `find_renderer()` matches by case-insensitive
-  substring on friendly name.
-- **`queue_manager.py`** — the real logic. `QueueSession` is a per-renderer
-  state machine driving playback; module-level `_sessions` dict (keyed by
-  renderer UDN) is the session registry, and a single shared UPnP notify
-  server / event handler is started lazily and torn down when the last session
-  ends.
+  `239.255.255.250:1900`) + device-description XML parsing. Captures identity
+  (`manufacturer`/`model_name`) and `is_openhome` (av-openhome-org Playlist
+  present) for backend selection. 5-min module cache; `find_renderer()` matches
+  case-insensitive substring on friendly name.
+- **`control_point.py`** — `ControlPoint` owns the shared UPnP infra (requester
+  / notify server / event handler / factory) and the per-UDN session registry.
+  `ensure_started()` closes the lazy-init race with a double-checked lock;
+  `unregister()` tears the infra down when the last session leaves. This is the
+  intended home for the SSDP listener + device registry (later phases).
+- **`backends/`** — `PlaybackBackend` ABC (`base.py`) + `AvTransportBackend`
+  (`avtransport.py`). The backend owns **all device I/O**: the `DmrDevice`,
+  RenderingControl volume/mute, transport-state polling, and raw `LAST_CHANGE`
+  parsing. The ABC is deliberately small and **provisional** until the OpenHome
+  spike proves the device-owned-queue shape (`owns_queue` seam).
+- **`queue_manager.py`** — `QueueSession` owns the queue (track list + index)
+  and the gapless/auto-advance event *reaction*, delegating device I/O to its
+  `backend`. `_make_backend()` is the factory (today always AVTransport; OpenHome
+  /Sonos slot in by identity). A module `_default_control_point` backs the
+  `play_tracks`/`get_session` facade.
 
 ### Key behaviors that span files
 
 - **Gapless vs. auto-advance.** Renderers advertising `SetNextAVTransportURI`
-  (the `supports_next` flag, detected by parsing the AVTransport SCPD during
-  discovery) get the next track preloaded for gapless transition. Renderers
-  without it are auto-advanced in `_on_event` when a `STOPPED` event arrives
-  *after* the current track actually reached `PLAYING` (the `played` gate).
-  The `_advancing` flag dedupes duplicate `STOPPED` events.
+  (`supports_next`, from the AVTransport SCPD at discovery) get the next track
+  preloaded. Renderers without it are auto-advanced in
+  `QueueSession._on_transport_event` when a `STOPPED` arrives *after* the prior
+  reported state was OK (the `played` gate, computed from `_prev_transport_state`
+  — a per-event mirror, **not** a sticky flag, so a `TRANSITIONING` between
+  `PLAYING` and a transient `STOPPED` isn't read as track-end). `_advancing`
+  dedupes duplicate `STOPPED`.
 
-- **Transport state is the source of truth.** `status()` reports what the
-  renderer actually says (`PLAYING`/`STOPPED`/`NO_MEDIA_PRESENT`), never
-  "playing" just because a session is bound. `_on_event` consumes AVTransport
-  `LAST_CHANGE` events. Event delivery gives a **list** of state-variable
-  objects (not a dict) — `_on_event` folds it to a name→value map; getting this
-  wrong silently breaks all transition detection. `start()` confirms playback
-  began within a timeout, raising if the renderer reports a dead state (so a
-  404 media URL surfaces as a failure rather than a false success).
+- **Event flow is split.** The backend's `_handle_raw_event` parses the
+  `LAST_CHANGE` event — delivery is a **list** of state-variable objects (not a
+  dict); folding it wrong silently breaks all transition detection — caches
+  transport-state + volume, then forwards `(transport_state, current_uri)` to
+  `QueueSession._on_transport_event`. `status()` reports the backend's real
+  transport state, never "playing" just because a backend is bound. `start()`
+  confirms playback within a timeout, raising on a dead state (404 URL → failure,
+  not false success).
 
-- **Event-silent renderers.** Some renderers (e.g. HiFiBerryOS) never emit
-  `LAST_CHANGE`. For those, `_query_transport_state()` actively polls
-  `GetTransportInfo` (bounded by `_TRANSPORT_POLL_TIMEOUT`), and `get_status`
-  calls `refresh_state()` before reporting.
+- **Event-silent renderers** (e.g. HiFiBerryOS) never emit `LAST_CHANGE`. The
+  backend's `query_transport_state()` actively polls `GetTransportInfo` (bounded
+  by `_TRANSPORT_POLL_TIMEOUT`); `get_status` calls `refresh_state()` →
+  `backend.refresh()` first.
 
-- **Volume/mute bypass the DmrDevice abstraction.** They call the
-  `RenderingControl` service actions directly (raw 0–100 `SetVolume`/`GetVolume`
-  /`SetMute`/`GetMute`) instead of `async_upnp_client`'s `DmrDevice` helpers.
-  Reason: some renderers (Linn) advertise a bogus volume max (2^31-1), which
-  makes `DmrDevice.async_set_volume_level` send a huge value and read
+- **Volume/mute bypass the DmrDevice abstraction** (in `AvTransportBackend`).
+  They call `RenderingControl` actions directly (raw 0–100) instead of
+  `DmrDevice` helpers, because some renderers (Linn) advertise a bogus volume max
+  (2^31-1) that makes `async_set_volume_level` send a huge value and read
   `volume_level`/`has_volume_mute` as None/False. `_volume_scale()` treats an
-  insane advertised range as 0–100. See the long comment block above
-  `_rendering_control()` before changing any volume code.
+  insane range as 0–100. Read the comment block above `_rendering_control()`
+  before touching volume. (Once `OpenHomeBackend` lands, Linn uses its OpenHome
+  Volume service and this is only the AVTransport fallback.)
 
-- **DIDL-Lite metadata** (`didl.py`) is built per track and passed to
-  `SetAVTransportURI`/`SetNextAVTransportURI`; audio uses `MusicTrack`, video
-  uses `Movie`.
+- **DIDL-Lite metadata** (`didl.py`) is built per track in `QueueSession` and
+  passed to the backend; audio uses `MusicTrack`, video uses `Movie`. The plan
+  migrates this to a hybrid library + per-device-family protocolInfo strategy
+  (strict TVs need exact `DLNA.ORG_PN` the library won't infer).
 
 ## Conventions
 
@@ -87,10 +107,13 @@ Three source modules under `src/renfield_mcp_dlna/`, layered:
   Never `print()` to stdout.
 - Async throughout; tests use `asyncio_mode=auto` so no `@pytest.mark.asyncio`
   is needed.
-- Tests mock the `_dmr` / RenderingControl layer rather than hitting a real
-  renderer (see `_mock_dmr_with_rc` in `tests/test_server.py`).
-- `DLNA_LISTEN_IP` overrides the auto-detected local IP used for the UPnP
-  event-callback URL — needed when local-IP detection picks the wrong interface.
+- Tests mock the backend's `_dmr` / RenderingControl layer rather than hitting a
+  real renderer (`_mock_dmr_with_rc`, `_connected_backend` in
+  `tests/test_server.py`); queue-reaction tests drive
+  `QueueSession._on_transport_event(state, uri)` directly.
+- `DLNA_LISTEN_IP` (read in `control_point.detect_local_ip`) overrides the
+  auto-detected local IP for the UPnP event-callback URL — needed when local-IP
+  detection picks the wrong interface.
 
 ## Deployment note
 
