@@ -11,15 +11,16 @@ alongside) standard UPnP AVTransport/RenderingControl:
     on Linn, whose RenderingControl advertises a bogus max (the workaround the
     AVTransport backend needs); the OpenHome Volume service reports a real max.
 
-Validation status (against real Linn Majik/Sneaky DSM hardware):
-  * Sibling-device discovery (host-correlated openhome_location), version-flexible
-    service resolution (Volume:4), and volume/mute reads — VERIFIED (the OpenHome
-    volume matched the AVTransport RenderingControl reading).
-  * The PLAYBACK path (load_queue → Insert/SeekId/Play, go_next/go_previous) is
-    still UNVERIFIED — no audio has actually been played through it.
-Because playback is unproven, the factory still routes OpenHome renderers here
-only when RENFIELD_OPENHOME=1, so it can't regress Linn playback via AVTransport.
-Enable it to validate the playlist path against hardware.
+Validation status — VERIFIED end-to-end against real Linn (Sneaky DSM "Ben's
+Zimmer", Majik DSM):
+  * Sibling-device discovery (host-correlated openhome_location) + version-flexible
+    service resolution (Volume:4).
+  * volume/mute reads matched the AVTransport RenderingControl values.
+  * PLAYBACK: load_queue (Insert→ids/SeekId/Play) reached real device
+    TransportState=PLAYING; go_next advanced to track 2 (still PLAYING); stop
+    cleaned up. Real state read via the Transport service (TransportState→State).
+Still routed only when RENFIELD_OPENHOME=1 (a deliberate default — flipping all
+Linn off AVTransport is the user's call), but it's no longer unproven.
 """
 
 import logging
@@ -35,6 +36,16 @@ logger = logging.getLogger(__name__)
 # Version-flexible prefixes — real Linn advertises Playlist:1, Volume:4, etc.
 _PLAYLIST_PREFIX = "urn:av-openhome-org:service:Playlist:"
 _VOLUME_PREFIX = "urn:av-openhome-org:service:Volume:"
+_TRANSPORT_PREFIX = "urn:av-openhome-org:service:Transport:"
+
+# OpenHome Transport.TransportState values → the standard UPnP vocabulary the
+# rest of the code (TRANSPORT_OK/DEAD, status) speaks.
+_OH_STATE_MAP = {
+    "PLAYING": "PLAYING",
+    "PAUSED": "PAUSED_PLAYBACK",
+    "STOPPED": "STOPPED",
+    "BUFFERING": "TRANSITIONING",
+}
 
 
 class OpenHomeBackend(PlaybackBackend):
@@ -175,10 +186,24 @@ class OpenHomeBackend(PlaybackBackend):
         return  # device manages gapless natively
 
     async def query_transport_state(self) -> str | None:
+        """Read the REAL device state from the OpenHome Transport service
+        (action TransportState → out arg State), mapped to standard vocabulary.
+        Falls back to the optimistic cache if the Transport service is absent."""
+        svc = self._service(_TRANSPORT_PREFIX)
+        if svc is None:
+            return self._transport_state
+        try:
+            res = await svc.action("TransportState").async_call()
+            raw = str(res.get("State", "")).upper()
+        except Exception:  # noqa: BLE001 - best-effort read
+            return self._transport_state
+        mapped = _OH_STATE_MAP.get(raw)
+        if mapped:
+            self._transport_state = mapped
         return self._transport_state
 
     async def refresh(self) -> None:
-        return  # best-effort; OpenHome state tracking is command-driven here
+        await self.query_transport_state()
 
     # -- volume / mute (OpenHome Volume service) ---------------------------
 

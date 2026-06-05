@@ -2142,3 +2142,43 @@ class TestOpenHomeVersionFlexibleServices:
         factory.async_create_device.assert_awaited_once_with(
             "http://10.0.0.9:55178/oh/device.xml"
         )
+
+
+class TestOpenHomeRealTransportState:
+    """OpenHomeBackend reads real device state from the Transport service
+    (action TransportState → State), validated against a real Linn."""
+
+    def _device_with_transport(self, state_value):
+        async def _ts_call(**kw):
+            return {"State": state_value}
+        act = MagicMock()
+        act.async_call = AsyncMock(side_effect=_ts_call)
+        transport = MagicMock()
+        transport.action.return_value = act
+        dev = MagicMock()
+        dev.services = {"urn:av-openhome-org:service:Transport:1": transport}
+        return dev
+
+    async def test_reads_and_maps_playing(self):
+        b = OpenHomeBackend(_make_renderer())
+        b._device = self._device_with_transport("Playing")
+        assert await b.query_transport_state() == "PLAYING"
+        assert b.transport_state == "PLAYING"
+
+    async def test_maps_buffering_to_transitioning(self):
+        b = OpenHomeBackend(_make_renderer())
+        b._device = self._device_with_transport("Buffering")
+        assert await b.query_transport_state() == "TRANSITIONING"
+
+    async def test_maps_paused_and_stopped(self):
+        b = OpenHomeBackend(_make_renderer())
+        b._device = self._device_with_transport("Paused")
+        assert await b.query_transport_state() == "PAUSED_PLAYBACK"
+        b._device = self._device_with_transport("Stopped")
+        assert await b.query_transport_state() == "STOPPED"
+
+    async def test_falls_back_to_cache_without_transport_service(self):
+        b = OpenHomeBackend(_make_renderer())
+        b._device, _ = _mock_openhome_device()  # only Playlist + Volume
+        b._transport_state = "PLAYING"
+        assert await b.query_transport_state() == "PLAYING"

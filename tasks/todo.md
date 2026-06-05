@@ -30,8 +30,15 @@ Ran against the real LAN — **7 renderers + Jellyfin** — all core functionali
 Live findings (minor): Samsung Flip WM55B returns HTTP 404 on its control path (device quirk,
 handled gracefully); HiFiBerryOS reported duration=0 at stream start (position worked).
 
-Still unproven on hardware: OpenHome *playback* (load_queue; volume/discovery done), Sonos (no unit
-on this LAN), TV video metadata, the passive SSDP listener + GENA watchdog (deliberately not built).
+- ✅ **OpenHome PLAYBACK verified** (Linn Ben's Zimmer, `RENFIELD_OPENHOME=1`): `load_queue`
+  (Insert→ids `[13,14]`/SeekId/Play) reached **real device `TransportState=PLAYING`**, `go_next`
+  advanced to track 2 (still PLAYING), stop cleaned up. Added a real Transport-service state read
+  (`TransportState`→`State`) — OpenHomeBackend no longer reports optimistic state. OpenHome is now
+  fully validated (discovery + volume + playback); still env-gated by default (flipping all Linn
+  off AVTransport is the user's call).
+
+Still unproven on hardware: Sonos (no unit on this LAN), TV video metadata; the passive SSDP
+listener + GENA watchdog are deliberately not built.
 
 ---
 
