@@ -58,15 +58,14 @@ Still unproven on hardware: Sonos (no unit on this LAN), TV video metadata.
 - ✅ **T1 (partial)** additive multi-interface M-SEARCH (ifaddr; default-route path unchanged).
 - ✅ **T12 (partial)** per-UDN play lock (done in update 2).
 
-**Genuinely remaining — deliberately NOT implemented blind (net-negative without hardware):**
-- **T1 passive SSDP listener** (alive/byebye live cache) — rewrites the working discovery-receive
-  loop; mock tests can't validate real multicast behaviour.
-- **T12 autonomous NOTIFY/GENA watchdog** — would interfere with the carefully-tuned event-reaction
-  logic (the area the code review already caught a regression in); the library already does
-  `auto_resubscribe` and `get_status` refreshes on demand. Real recovery needs a long-lived device
-  + reboot to validate.
-- **Validation pass**: run the env-gated OpenHome/Sonos backends + TV metadata + multi-interface
-  discovery against real Linn/Samsung/Sonos/multi-NIC hosts, then promote from provisional.
+**Genuinely remaining:**
+- **T1 passive SSDP listener** — ✅ DONE (see Update 3): built on `async-upnp-client`'s
+  `SsdpListener` and live-validated, after the device was on the network to test against.
+- **T12 watchdog** — built as a **read-only** session-state refresh (not the autonomous
+  re-subscribe loop, which was deemed net-negative: the library's `auto_resubscribe` already
+  handles GENA renewal). See Update 3.
+- **Validation pass (still open)**: run the env-gated Sonos backend + TV video metadata against
+  real Sonos/Samsung hardware, then promote from provisional. (OpenHome already promoted.)
 
 ---
 
