@@ -10,13 +10,16 @@ Auto-advance / gapless state machine (driven by _on_transport_event):
 
             play_uri(track 1)
   idle ───────────────────▶ buffering ──PLAYING──▶ playing
-   ▲                            │ (_has_played=True)   │
+   ▲                            │ (prior state OK)     │
    │                     STOPPED/NO_MEDIA              │ gapless: CurrentTrackURI
-   │                     (pre-play, _has_played=False: │   == preloaded.url → adopt
-   │                      ignored — no advance/cleanup)│   preloaded index, preload next
-   └──── _cleanup ◀── STOPPED (last track, _has_played)│
+   │                     (pre-play, prior state NOT    │   == preloaded.url → adopt
+   │                      OK: ignored — no advance)    │   preloaded index, preload next
+   └──── _cleanup ◀── STOPPED (last track, played) ────│
               ▲                                         │
-              └── no-SetNext: STOPPED (_has_played) ───▶ _auto_advance (deduped via _advancing)
+              └── no-SetNext: STOPPED (played) ────────▶ _auto_advance (deduped via _advancing)
+
+  "played" = the renderer's PRIOR reported state was PLAYING/PAUSED (_prev_transport_state),
+  so a transient STOPPED during buffering — or after a TRANSITIONING — is never read as track-end.
 """
 
 import asyncio
@@ -139,11 +142,14 @@ class QueueSession:
         self.current_index = 0
         self.backend: PlaybackBackend = _make_backend(renderer)
         self._preloaded_index: int | None = None
-        # True once the *current* track has actually reached a playing state.
-        # Gates STOPPED handling so a transient pre-playback STOPPED (buffering
-        # window) doesn't skip track 1 or tear down a single-track session.
-        # Reset whenever a new track is loaded.
-        self._has_played = False
+        # Session-side mirror of the renderer's last-reported TransportState,
+        # used only for the "did it actually play *before* this STOPPED?" gate.
+        # Kept here (not read from the backend) because the backend updates its
+        # own cache to the CURRENT state before invoking our callback, so we'd
+        # lose the prior value. This reproduces the original per-event logic
+        # exactly — a sticky "has ever played" flag would mishandle a
+        # TRANSITIONING state landing between PLAYING and a transient STOPPED.
+        self._prev_transport_state: str | None = None
         # Guards the no-SetNext auto-advance against duplicate STOPPED events
         # firing a second _auto_advance before the first incremented the index.
         self._advancing = False
@@ -231,8 +237,14 @@ class QueueSession:
         only the *queue* consequences: gapless transition, auto-advance, and
         end-of-queue cleanup.
         """
-        if (transport_state or "").upper() in TRANSPORT_OK:
-            self._has_played = True
+        # Did the renderer actually reach a playing state *before* this event?
+        # A transient STOPPED/NO_MEDIA during the initial buffering window must
+        # NOT be mistaken for track-end (it would skip track 1 or tear down a
+        # single-track session). Computed from the PRIOR state, then advance the
+        # mirror — exactly as the original did before updating _transport_state.
+        played = (self._prev_transport_state or "").upper() in TRANSPORT_OK
+        if transport_state:
+            self._prev_transport_state = transport_state
 
         # Detect gapless transition: renderer switched to the preloaded track.
         if current_uri and self._preloaded_index is not None:
@@ -253,7 +265,7 @@ class QueueSession:
         # duplicate STOPPED events that would otherwise skip a track.
         if (
             transport_state == "STOPPED"
-            and self._has_played
+            and played
             and not self.backend.supports_next
             and self.current_index < len(self.tracks) - 1
             and not self._advancing
@@ -267,7 +279,7 @@ class QueueSession:
         # against a transient pre-playback STOPPED tearing down the session).
         if (
             transport_state == "STOPPED"
-            and self._has_played
+            and played
             and self.current_index >= len(self.tracks) - 1
         ):
             logger.info(f"[{self.renderer.name}] Queue finished")
@@ -280,7 +292,6 @@ class QueueSession:
                 return
             self.current_index += 1
             self._preloaded_index = None
-            self._has_played = False
             track = self.tracks[self.current_index]
             try:
                 await self.backend.play_uri(
@@ -293,8 +304,9 @@ class QueueSession:
             except Exception as e:
                 logger.error(f"[{self.renderer.name}] Auto-advance failed: {e}")
         finally:
-            # Re-arm for the next track's STOPPED. The _has_played gate prevents
-            # a premature re-advance until the new track actually reaches PLAYING.
+            # Re-arm for the next track's STOPPED. The played gate (prior state
+            # must have been OK) prevents a premature re-advance until the new
+            # track actually reaches PLAYING.
             self._advancing = False
 
     async def _preload_next(self) -> None:
@@ -322,7 +334,6 @@ class QueueSession:
             return None
         self.current_index += 1
         self._preloaded_index = None
-        self._has_played = False
         track = self.tracks[self.current_index]
         await self.backend.play_uri(track.url, track.title, self._build_metadata(track))
         await self._preload_next()
@@ -338,7 +349,6 @@ class QueueSession:
             return None
         self.current_index -= 1
         self._preloaded_index = None
-        self._has_played = False
         track = self.tracks[self.current_index]
         await self.backend.play_uri(track.url, track.title, self._build_metadata(track))
         await self._preload_next()

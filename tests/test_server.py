@@ -967,6 +967,22 @@ class TestStopEventGuards:
         await asyncio.sleep(0)
         s._cleanup.assert_awaited_once()
 
+    async def test_stopped_right_after_transitioning_is_not_track_end(self):
+        # Regression (code review issue #1): the played-gate reads the PRIOR
+        # reported state, not a sticky "has ever played" flag. PLAYING →
+        # TRANSITIONING → STOPPED means the STOPPED's prior state is
+        # TRANSITIONING (a glitch/buffer), NOT a real track end — so neither
+        # auto-advance nor cleanup may fire. A sticky flag would wrongly fire.
+        s = QueueSession(_make_renderer(supports_next=False), _make_tracks(3))
+        s._auto_advance = AsyncMock()
+        s._cleanup = AsyncMock()
+        s._on_transport_event("PLAYING", None)
+        s._on_transport_event("TRANSITIONING", None)
+        s._on_transport_event("STOPPED", None)
+        await asyncio.sleep(0)
+        s._auto_advance.assert_not_awaited()
+        s._cleanup.assert_not_awaited()
+
 
 # ---------------------------------------------------------------------------
 # PlaybackBackend seam (Phase 1 backend extraction)

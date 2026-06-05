@@ -25,6 +25,11 @@ flags that difference to QueueSession.
 
 from abc import ABC, abstractmethod
 from collections.abc import Callable
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # avoid a runtime dependency in the abstract layer
+    from async_upnp_client.client_factory import UpnpFactory
+    from async_upnp_client.event_handler import UpnpEventHandler
 
 # A parsed transport event forwarded from a backend to its session:
 # (transport_state, current_track_uri). Either field may be None when the
@@ -67,9 +72,23 @@ class PlaybackBackend(ABC):
         """Last-known raw UPnP TransportState, or None if never reported."""
 
     @abstractmethod
-    async def connect(self, on_event: TransportEvent) -> None:
+    async def connect(
+        self,
+        on_event: TransportEvent,
+        *,
+        factory: "UpnpFactory",
+        event_handler: "UpnpEventHandler",
+    ) -> None:
         """Bind to the device and subscribe to events, forwarding parsed
-        (transport_state, current_uri) changes to `on_event`."""
+        (transport_state, current_uri) changes to `on_event`.
+
+        `factory`/`event_handler` are the shared UPnP infrastructure, injected
+        rather than reached for globally. This is PROVISIONAL: it suits the
+        UPnP-based backends (AVTransport, OpenHome both use async_upnp_client),
+        but the Sonos/soco backend won't need them — the signature is revisited
+        once the ControlPoint (which will own this infra) lands. Until then,
+        keeping them in the contract stops a new backend silently diverging.
+        """
 
     @abstractmethod
     async def disconnect(self) -> None:
