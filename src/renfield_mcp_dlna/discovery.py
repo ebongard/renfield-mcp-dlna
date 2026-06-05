@@ -27,9 +27,17 @@ _SEARCH_TARGET = "urn:schemas-upnp-org:device:MediaRenderer:1"
 CACHE_TTL = 300  # 5 minutes
 
 
+_OPENHOME_PLAYLIST_TYPE = "urn:av-openhome-org:service:Playlist:1"
+
+
 @dataclass
 class DlnaRenderer:
-    """Discovered DLNA MediaRenderer."""
+    """Discovered DLNA MediaRenderer.
+
+    Identity fields (manufacturer/model) feed the backend factory's
+    device-class selection; is_openhome flags renderers (Linn et al.) that
+    expose the av-openhome-org Playlist service for native device-side queues.
+    """
 
     name: str
     udn: str
@@ -38,6 +46,9 @@ class DlnaRenderer:
     av_transport_control_url: str
     rendering_control_url: str = ""
     base_url: str = ""
+    manufacturer: str = ""
+    model_name: str = ""
+    is_openhome: bool = False
 
 
 _renderer_cache: list[DlnaRenderer] = []
@@ -184,9 +195,14 @@ async def _fetch_device_description(
         logger.debug(f"No UDN for device '{friendly_name}' at {location}")
         return None
 
+    # Identity drives backend-class selection downstream.
+    manufacturer = device.findtext(f"{{{_NS_DEVICE}}}manufacturer", "")
+    model_name = device.findtext(f"{{{_NS_DEVICE}}}modelName", "")
+
     base_url = _base_url_from_location(location)
     av_control_url = ""
     rc_control_url = ""
+    is_openhome = False
 
     service_list = device.find(f"{{{_NS_DEVICE}}}serviceList")
     if service_list is None:
@@ -206,6 +222,9 @@ async def _fetch_device_description(
             )
         elif service_type == _RENDERING_CONTROL_TYPE:
             rc_control_url = control_url or ""
+        elif service_type == _OPENHOME_PLAYLIST_TYPE:
+            # OpenHome renderer (Linn et al.): owns the queue device-side.
+            is_openhome = True
 
     if not av_control_url:
         logger.debug(f"No AVTransport service for '{friendly_name}' at {location}")
@@ -225,6 +244,9 @@ async def _fetch_device_description(
         av_transport_control_url=av_control_url,
         rendering_control_url=rc_control_url,
         base_url=base_url,
+        manufacturer=manufacturer,
+        model_name=model_name,
+        is_openhome=is_openhome,
     )
 
 

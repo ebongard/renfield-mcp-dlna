@@ -111,10 +111,17 @@ class Track:
 def _make_backend(renderer: DlnaRenderer) -> PlaybackBackend:
     """Select the playback backend for a renderer.
 
-    Today every renderer uses AVTransport. The OpenHome and Sonos backends slot
-    in here (keyed on advertised services / identity) without QueueSession
-    changing — that's the point of the PlaybackBackend seam.
+    The OpenHome and Sonos backends slot in here (keyed on advertised services /
+    identity) without QueueSession changing — that's the point of the
+    PlaybackBackend seam. OpenHome renderers are detected at discovery
+    (renderer.is_openhome); until OpenHomeBackend lands (Phase 5) they still use
+    AVTransport, which they also advertise.
     """
+    if renderer.is_openhome:
+        logger.debug(
+            f"[{renderer.name}] OpenHome renderer — using AVTransport until "
+            f"OpenHomeBackend lands (native Playlist queue pending)"
+        )
     return AvTransportBackend(renderer)
 
 

@@ -1019,3 +1019,81 @@ class TestBackendSeam:
         assert s.current_index == 0  # unchanged
         assert s._preloaded_index == 1
         s._preload_next.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Device identity + OpenHome detection (feeds backend-class selection)
+# ---------------------------------------------------------------------------
+
+_DESC_TMPL = """<?xml version="1.0"?>
+<root xmlns="urn:schemas-upnp-org:device-1-0">
+  <device>
+    <friendlyName>{name}</friendlyName>
+    <manufacturer>{mfr}</manufacturer>
+    <modelName>{model}</modelName>
+    <UDN>uuid:dev-1</UDN>
+    <serviceList>
+      <service>
+        <serviceType>urn:schemas-upnp-org:service:AVTransport:1</serviceType>
+        <controlURL>/AVTransport/ctrl</controlURL>
+        <SCPDURL>/AVTransport/scpd.xml</SCPDURL>
+      </service>
+      {extra_service}
+    </serviceList>
+  </device>
+</root>"""
+
+_OPENHOME_SVC = """<service>
+        <serviceType>urn:av-openhome-org:service:Playlist:1</serviceType>
+        <controlURL>/oh/Playlist/ctrl</controlURL>
+        <SCPDURL>/oh/Playlist/scpd.xml</SCPDURL>
+      </service>"""
+
+
+def _desc_session(xml: str):
+    """An aiohttp-like session whose GET returns the given description XML
+    (and an empty SCPD so SetNext detection runs without error)."""
+    resp = MagicMock()
+    resp.status = 200
+    resp.text = AsyncMock(return_value=xml)
+    ctx = MagicMock()
+    ctx.__aenter__ = AsyncMock(return_value=resp)
+    ctx.__aexit__ = AsyncMock(return_value=False)
+    session = MagicMock()
+    session.get = MagicMock(return_value=ctx)
+    return session
+
+
+class TestDeviceIdentity:
+    async def test_captures_manufacturer_and_model(self):
+        xml = _DESC_TMPL.format(
+            name="Living Room TV", mfr="Samsung", model="UE55", extra_service=""
+        )
+        r = await discovery._fetch_device_description(
+            _desc_session(xml), "http://1.2.3.4:8080/desc.xml"
+        )
+        assert r is not None
+        assert r.manufacturer == "Samsung"
+        assert r.model_name == "UE55"
+        assert r.is_openhome is False
+
+    async def test_detects_openhome_playlist_service(self):
+        xml = _DESC_TMPL.format(
+            name="Linn DS", mfr="Linn", model="Majik", extra_service=_OPENHOME_SVC
+        )
+        r = await discovery._fetch_device_description(
+            _desc_session(xml), "http://1.2.3.4:8080/desc.xml"
+        )
+        assert r is not None
+        assert r.is_openhome is True
+        assert r.manufacturer == "Linn"
+
+
+class TestBackendFactoryOpenHome:
+    def test_openhome_renderer_still_gets_avtransport_for_now(self):
+        # Seam is wired (is_openhome detected) but OpenHomeBackend is Phase 5;
+        # until then OpenHome renderers use the AVTransport they also advertise.
+        renderer = _make_renderer()
+        renderer.is_openhome = True
+        backend = queue_manager._make_backend(renderer)
+        assert isinstance(backend, AvTransportBackend)
