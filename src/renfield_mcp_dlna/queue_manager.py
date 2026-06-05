@@ -40,6 +40,8 @@ _PLAYBACK_CONFIRM_INTERVAL = 0.5
 # could block get_status for tens of seconds.
 _TRANSPORT_POLL_TIMEOUT = 3.0
 
+_RENDERING_CONTROL_TYPE = "urn:schemas-upnp-org:service:RenderingControl:1"
+
 
 def _detect_local_ip() -> str:
     """Detect local IP that can reach the network (for UPnP callback URL)."""
@@ -255,13 +257,24 @@ class QueueSession:
         current_uri = changes.get("CurrentTrackURI")
 
         # RenderingControl Volume rides on the same event stream; cache it so
-        # get_volume can answer without a SOAP round-trip.
+        # get_volume can answer without a SOAP round-trip. The event value is in
+        # the renderer's native units, so normalise to percent with the same
+        # scale get_volume/set_volume use — otherwise a 0-255 renderer would
+        # cache 128 and report it as "128%".
         volume = changes.get("Volume")
         if volume is not None:
             try:
-                self._volume = int(volume)
+                raw = int(volume)
             except (TypeError, ValueError):
-                pass
+                raw = None
+            if raw is not None:
+                rc = self._rendering_control()
+                if rc is not None:
+                    scale = self._volume_scale(rc)
+                    self._volume = max(0, min(100, round(raw / scale * 100)))
+                elif 0 <= raw <= 100:
+                    # RC not resolvable yet; only trust an already-percent value.
+                    self._volume = raw
 
         # Did the renderer actually reach a playing state for this track? A
         # transient STOPPED/NO_MEDIA_PRESENT during the initial buffering window
@@ -426,52 +439,93 @@ class QueueSession:
             raise RuntimeError("No active playback session")
         await self._dmr.async_play()
 
+    # Volume/mute go through the RenderingControl service DIRECTLY (raw 0-100
+    # SetVolume/GetVolume/SetMute/GetMute), NOT async_upnp_client's DmrDevice
+    # helpers. DmrDevice normalises by the advertised volume range, and some
+    # renderers (Linn) advertise a bogus max (2^31-1) — async_set_volume_level
+    # would then send ~858M for "40%" and the renderer clamps to its real max
+    # = full-blast. DmrDevice.volume_level / has_volume_mute also read as
+    # None/False on those renderers even though the RC actions work fine.
+    def _rendering_control(self):
+        """The RenderingControl service for direct action calls, or None."""
+        if self._dmr is None:
+            return None
+        return self._dmr.device.services.get(_RENDERING_CONTROL_TYPE)
+
+    @staticmethod
+    def _volume_scale(rc) -> int:
+        """Renderer's RC volume max. Honours a sane advertised range, else 100.
+
+        Linn advertises 0..2147483647 (no real range) — treated as 0-100, the
+        scale its CurrentVolume actually uses.
+        """
+        try:
+            mx = rc.action("SetVolume").argument("DesiredVolume").related_state_variable.max_value
+            if mx and 2 <= int(mx) <= 1000:
+                return int(mx)
+        except Exception:  # noqa: BLE001 - missing/odd range -> safe default
+            pass
+        return 100
+
     async def set_volume(self, volume: int) -> None:
-        """Set playback volume (0-100)."""
+        """Set playback volume (0-100) via direct RC SetVolume."""
         if self._dmr is None:
             raise RuntimeError("No active playback session")
-        await self._dmr.async_set_volume_level(volume / 100.0)
-        # Reflect our own write in the cache so get_volume stays consistent
-        # without waiting for the renderer's echoed Volume event.
-        self._volume = volume
+        rc = self._rendering_control()
+        if rc is None or "SetVolume" not in rc.actions:
+            raise RuntimeError("Renderer does not support volume control")
+        pct = max(0, min(100, volume))
+        scale = self._volume_scale(rc)
+        desired = max(0, min(scale, round(pct / 100 * scale)))
+        await rc.action("SetVolume").async_call(
+            InstanceID=0, Channel="Master", DesiredVolume=desired
+        )
+        # Reflect our own write in the cache (in percent) so get_volume stays
+        # consistent without waiting for the renderer's echoed Volume event.
+        self._volume = pct
 
     async def set_mute(self, mute: bool) -> None:
-        """Mute (True) or unmute (False) via native RenderingControl SetMute.
+        """Mute (True) or unmute (False) via direct RC SetMute.
 
-        On renderers that support it, mute is tracked independently of the
-        volume level, so unmute restores the prior volume without us storing it.
-        Renderers without RC/SetMute raise a clear error rather than a generic
-        UpnpError.
+        Mute is tracked independently of the volume level, so unmute restores
+        the prior volume without us storing it. Capability is detected by the
+        SetMute action being present (NOT DmrDevice.has_volume_mute, which reads
+        False on renderers whose GetMute the DmrDevice abstraction can't parse).
         """
         if self._dmr is None:
             raise RuntimeError("No active playback session")
-        if not self._dmr.has_volume_mute:
+        rc = self._rendering_control()
+        if rc is None or "SetMute" not in rc.actions:
             raise RuntimeError("Renderer does not support mute")
-        await self._dmr.async_mute_volume(mute)
+        await rc.action("SetMute").async_call(
+            InstanceID=0, Channel="Master", DesiredMute=mute
+        )
 
     async def get_volume(self) -> int | None:
         """Current volume (0-100), or None if the renderer can't report it.
 
         Prefers the cached value maintained by _on_event / set_volume (no SOAP
-        round-trip). Falls back to a bounded async_update() read, mirroring
-        refresh_state()'s timeout handling.
+        round-trip). Falls back to a bounded direct RC GetVolume read.
         """
         if self._volume is not None:
             return self._volume
-        if self._dmr is None:
+        rc = self._rendering_control()
+        if rc is None or "GetVolume" not in rc.actions:
             return None
         try:
-            await asyncio.wait_for(
-                self._dmr.async_update(), timeout=_TRANSPORT_POLL_TIMEOUT
+            res = await asyncio.wait_for(
+                rc.action("GetVolume").async_call(InstanceID=0, Channel="Master"),
+                timeout=_TRANSPORT_POLL_TIMEOUT,
             )
         except Exception:  # noqa: BLE001 - read is best-effort, mirror _query_transport_state
             return None
-        level = self._dmr.volume_level
-        if level is None:
+        cur = res.get("CurrentVolume")
+        if cur is None:
             return None
-        vol = round(level * 100)
-        # A Volume event may have landed via _on_event while async_update() ran;
-        # that value is fresher than this poll, so don't clobber it.
+        scale = self._volume_scale(rc)
+        vol = max(0, min(100, round(int(cur) / scale * 100)))
+        # A Volume event may have landed via _on_event while the read ran;
+        # that value is fresher, so don't clobber it.
         if self._volume is None:
             self._volume = vol
         return vol
