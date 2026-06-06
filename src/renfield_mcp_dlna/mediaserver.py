@@ -132,5 +132,7 @@ async def resolve_playables(
         return playables
 
     # Otherwise treat it as a single object and read its own metadata.
+    # async_browse_metadata returns ONE DidlObject (not a browse-result wrapper
+    # with .result), so wrap it for _parse_objects.
     meta = await dms.async_browse_metadata(object_id)
-    return [d for d in _parse_objects(meta.result) if d["playable"]]
+    return [d for d in _parse_objects([meta]) if d["playable"]]

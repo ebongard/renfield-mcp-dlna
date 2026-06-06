@@ -9,6 +9,14 @@ Confirmed scope: renderers + MediaServers; device classes OpenHome (Linn), DLNA 
 (Samsung/LG/Sony), standard AVTransport (HiFiBerry/Kodi/VLC), Sonos; IPv4 multi-interface
 live-cache discovery.
 
+> **Samsung TV control moved out (2026-06-06).** Waking/controlling a Samsung TV is
+> vendor-specific (websocket remote + Wake-on-LAN), not a DLNA operation — and the TV's
+> DLNA renderer (`:9197`) is unreliable on 2022+ sets. So Samsung lives in a dedicated
+> sibling server, **`../renfield-mcp-samsung`** (adapted from the MIT `samsung-tv-mcp`,
+> built on `samsungtvws`). This repo stays DLNA-only for always-on streamers
+> (Linn/Sonos/HiFiBerry). A prototype "vendor wake layer" was built here and then reverted
+> in favour of that split.
+
 ## LIVE VALIDATION (real network, run via scripts/validate_live.py)
 
 Ran against the real LAN — **7 renderers + Jellyfin** — all core functionality verified:
@@ -36,6 +44,19 @@ handled gracefully); HiFiBerryOS reported duration=0 at stream start (position w
   (`TransportState`→`State`) — OpenHomeBackend no longer reports optimistic state. OpenHome is now
   fully validated (discovery + volume + playback); still env-gated by default (flipping all Linn
   off AVTransport is the user's call).
+
+- ✅ **OpenHome CROSS-GENERATION verified** (Linn Küche, `Sneaky Music DS` — older Davaar-era,
+  service path `UpnpAv`, vs the previously-only-validated `Sneaky DSM`). Read-only probe confirmed
+  identical OpenHome surface (`Playlist:1`/`Volume:4`/`Transport:1` — real-state reads work, not the
+  optimistic fallback; volume 40 cross-matched the AVTransport RC read). End-to-end via `play_tracks`
+  → `OpenHomeBackend.load_queue` reached real `TransportState=PLAYING`, `next()` (device `Next`)
+  advanced to track 2 still PLAYING, `stop` → STOPPED + session unregistered. Harness:
+  `scripts/validate_openhome_kueche.py`. OpenHomeBackend is generation-robust across Linn models.
+- 🐛 **Bug found + fixed during ^**: `mediaserver.resolve_playables` single-item fallback called
+  `meta.result`, but `DmsDevice.async_browse_metadata` returns a *single* `DidlObject` (no `.result`
+  wrapper) → `AttributeError` on any `play_from_server` of a single track item. The existing unit test
+  mocked the wrong return shape, hiding it. Fixed (`_parse_objects([meta])`) + test now mirrors the
+  real library shape (verified it fails against the old code). Container/album path was unaffected.
 
 - ✅ **Passive SSDP listener + session watchdog BUILT** (`control_point.start_discovery_listener`
   / `start_session_watchdog`, wired into streamable-http `server.main`). Listener live-validated:

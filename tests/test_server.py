@@ -1568,9 +1568,11 @@ class TestMediaServerBrowseSearch:
     async def test_resolve_playables_single_item_fallback(self, monkeypatch):
         dms = MagicMock()
         dms.async_browse_direct_children = AsyncMock(return_value=_browse_result([]))  # no children
-        dms.async_browse_metadata = AsyncMock(return_value=_browse_result([
-            _didl_obj("t1", "Solo", "object.item.audioItem.musicTrack", url="http://srv/solo.flac"),
-        ]))
+        # async_browse_metadata returns a SINGLE DidlObject (not a browse-result
+        # wrapper) — mirror the real library so this asserts real behavior.
+        dms.async_browse_metadata = AsyncMock(return_value=_didl_obj(
+            "t1", "Solo", "object.item.audioItem.musicTrack", url="http://srv/solo.flac",
+        ))
         monkeypatch.setattr(mediaserver, "_make_dms", AsyncMock(return_value=dms))
         playables = await mediaserver.resolve_playables(_make_server(), MagicMock(), "t1")
         assert len(playables) == 1
