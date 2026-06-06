@@ -64,41 +64,52 @@ async def main() -> None:
     cp = queue_manager._default_control_point
     await cp.ensure_started()
 
-    playables = await _find_album_tracks(s, cp.factory, limit=2)
-    tracks = [
-        Track(url=p["url"], title=p.get("title", ""), artist=p.get("artist", ""),
-              album=p.get("album", ""))
-        for p in playables
-    ]
-    print("Queue:")
-    for i, t in enumerate(tracks, 1):
-        print(f"  {i}. {t.title!r}  ({t.url[:70]}...)")
+    session = None
+    try:
+        playables = await _find_album_tracks(s, cp.factory, limit=2)
+        tracks = [
+            Track(url=p["url"], title=p.get("title", ""), artist=p.get("artist", ""),
+                  album=p.get("album", ""))
+            for p in playables
+        ]
+        print("Queue:")
+        for i, t in enumerate(tracks, 1):
+            print(f"  {i}. {t.title!r}  ({t.url[:70]}...)")
 
-    print("\n=== load_queue → Play track 1 ===")
-    session = await queue_manager.play_tracks(r, tracks, control_point=cp)
-    await asyncio.sleep(DWELL)
-    state1 = await session.backend.query_transport_state()
-    print(f"  track index={session.current_index + 1}  real TransportState={state1}")
-    assert state1 == "PLAYING", f"expected PLAYING, got {state1}"
+        print("\n=== load_queue → Play track 1 ===")
+        session = await queue_manager.play_tracks(r, tracks, control_point=cp)
+        await asyncio.sleep(DWELL)
+        state1 = await session.backend.query_transport_state()
+        print(f"  track index={session.current_index + 1}  real TransportState={state1}")
+        assert state1 == "PLAYING", f"expected PLAYING, got {state1}"
 
-    print("\n=== next() → device Next (track 2) ===")
-    nxt = await session.next()
-    print(f"  advanced to: {nxt.title if nxt else None!r}")
-    await asyncio.sleep(DWELL)
-    state2 = await session.backend.query_transport_state()
-    print(f"  track index={session.current_index + 1}  real TransportState={state2}")
-    assert session.current_index == 1, "index did not advance"
-    assert state2 == "PLAYING", f"expected PLAYING after next, got {state2}"
+        print("\n=== next() → device Next (track 2) ===")
+        nxt = await session.next()
+        print(f"  advanced to: {nxt.title if nxt else None!r}")
+        await asyncio.sleep(DWELL)
+        state2 = await session.backend.query_transport_state()
+        print(f"  track index={session.current_index + 1}  real TransportState={state2}")
+        assert session.current_index == 1, "index did not advance"
+        assert state2 == "PLAYING", f"expected PLAYING after next, got {state2}"
 
-    print("\n=== stop → cleanup ===")
-    await session.stop()
-    state3 = await session.backend.query_transport_state()
-    print(f"  post-stop TransportState={state3}")
-    print(f"  session in registry? {cp.get_session(r.udn) is not None}")
-    assert cp.get_session(r.udn) is None, "session not cleaned up"
+        print("\n=== stop → cleanup ===")
+        await session.stop()
+        state3 = await session.backend.query_transport_state()
+        print(f"  post-stop TransportState={state3}")
+        print(f"  session in registry? {cp.get_session(r.udn) is not None}")
+        assert cp.get_session(r.udn) is None, "session not cleaned up"
 
-    await cp.aclose()
-    print("\n✅ OpenHome playback VALIDATED on Sneaky Music DS (Küche).")
+        print("\n✅ OpenHome playback VALIDATED on Sneaky Music DS (Küche).")
+    finally:
+        # The OpenHome device owns its queue and keeps playing on its own, so an
+        # assertion/error that bails before the explicit stop above would leave
+        # the speaker playing. Always stop (if still registered) + tear down.
+        if session is not None and cp.get_session(r.udn) is not None:
+            try:
+                await session.stop()
+            except Exception:
+                pass
+        await cp.aclose()
 
 
 if __name__ == "__main__":
