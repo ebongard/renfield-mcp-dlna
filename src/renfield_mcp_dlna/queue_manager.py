@@ -177,30 +177,65 @@ class QueueSession:
     async def _confirm_playback_started(self, title: str) -> None:
         """Wait briefly for the renderer to confirm it began playback.
 
-        Raises RuntimeError if the renderer reports STOPPED/NO_MEDIA_PRESENT
-        (it accepted the command but couldn't play the stream — e.g. a 404
-        media URL). If no definitive state arrives within the timeout, log a
-        warning and continue rather than false-failing a renderer that simply
-        hasn't emitted an event yet.
+        Raises RuntimeError when the renderer accepted the command but did not
+        actually start (e.g. a 404/500 media URL, or a wedged renderer) — so a
+        non-start is a loud failure, never a false ``success``.
+
+        Two regimes, keyed on whether the renderer emits LAST_CHANGE events:
+
+        * **Event-emitting** renderers (Linn/OpenHome, Sonos, …): the event
+          populated ``transport_state`` — trust it (PLAYING → ok, STOPPED → dead).
+          No active polling; behaviour is unchanged for these devices.
+        * **Event-silent** renderers (e.g. HiFiBerryOS) never populate
+          ``transport_state`` AND their *polled* TransportState is unreliable
+          (observed reporting PLAYING while silent, and not reporting a clean
+          STOPPED on a failed stream). For these the ground truth is the playback
+          **position advancing**: poll it and require an increase. A position
+          that never advances within the window is a non-start → raise.
+
+        If neither signal is available (event renderer slow to emit, or a backend
+        that can't report position) we stay lenient: log a warning and continue
+        rather than false-failing.
         """
         # Wall-clock deadline: the poll fallback below can itself take seconds,
         # so summing the sleep interval would badly undercount elapsed time.
         deadline = time.monotonic() + _PLAYBACK_CONFIRM_TIMEOUT
+        prev_pos: int | None = None
+        positions_seen = 0
         while time.monotonic() < deadline:
-            state = (self.backend.transport_state or "").upper()
-            # Renderers that don't emit LAST_CHANGE events (e.g. HiFiBerryOS)
-            # never populate transport_state — actively poll GetTransportInfo
-            # so we can still confirm (or rule out) playback.
-            if not state:
-                state = (await self.backend.query_transport_state()) or ""
-            if state in TRANSPORT_OK:
-                return
-            if state in TRANSPORT_DEAD:
-                raise RuntimeError(
-                    f"renderer did not start playback (state={state}); "
-                    f"stream may be unreachable: {title}"
-                )
+            evented = (self.backend.transport_state or "").upper()
+            if evented:
+                # Event-emitting renderer → trust the evented state (unchanged).
+                if evented in TRANSPORT_OK:
+                    return
+                if evented in TRANSPORT_DEAD:
+                    raise RuntimeError(
+                        f"renderer did not start playback (state={evented}); "
+                        f"stream may be unreachable: {title}"
+                    )
+            else:
+                # Event-silent renderer → confirm via the position advancing.
+                polled, pos = await self.backend.query_playback()
+                if (polled or "").upper() in TRANSPORT_DEAD:
+                    raise RuntimeError(
+                        f"renderer did not start playback (state={polled}); "
+                        f"stream may be unreachable: {title}"
+                    )
+                if pos is not None:
+                    positions_seen += 1
+                    if prev_pos is not None and pos > prev_pos:
+                        return  # ground truth: the stream is being consumed
+                    prev_pos = pos
             await asyncio.sleep(_PLAYBACK_CONFIRM_INTERVAL)
+
+        # Timed out. For an event-silent renderer we DID read positions but they
+        # never advanced → a genuine non-start (e.g. an HTTP 500 stream), fail
+        # loudly. Otherwise (no usable signal) stay lenient.
+        if positions_seen >= 2:
+            raise RuntimeError(
+                f"renderer did not start playback (position stuck at {prev_pos}s); "
+                f"stream may be unreachable: {title}"
+            )
         logger.warning(
             f"[{self.renderer.name}] playback start unconfirmed for '{title}' "
             f"(last state={self.backend.transport_state})"

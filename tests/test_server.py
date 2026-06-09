@@ -732,22 +732,44 @@ class TestConfirmPlaybackStarted:
         s.backend._transport_state = None
         await s._confirm_playback_started("Track 1")  # warns, no raise
 
-    async def test_confirms_via_poll_when_no_event(self):
-        # Event-silent renderer (HiFiBerryOS): no LAST_CHANGE event ever fires,
-        # but an active GetTransportInfo poll reports PLAYING → confirmed.
+    async def test_confirms_via_position_advance_when_no_event(self, monkeypatch):
+        # Event-silent renderer (HiFiBerryOS): no LAST_CHANGE event, and its
+        # polled TransportState is NOT trusted — confirmation requires the
+        # playback POSITION to advance between polls.
+        monkeypatch.setattr(queue_manager, "_PLAYBACK_CONFIRM_INTERVAL", 0.01)
         s = QueueSession(_make_renderer(), _make_tracks(1))
         s.backend._transport_state = None
-        s.backend.query_transport_state = AsyncMock(return_value="PLAYING")
-        await s._confirm_playback_started("Track 1")  # no raise
-        s.backend.query_transport_state.assert_awaited()
+        s.backend.query_playback = AsyncMock(side_effect=[("PLAYING", 0), ("PLAYING", 2)])
+        await s._confirm_playback_started("Track 1")  # 0 -> 2: confirmed, no raise
+        assert s.backend.query_playback.await_count >= 2
+
+    async def test_silent_false_playing_stuck_position_raises(self, monkeypatch):
+        # The desync / false-PLAYING case: polled state says PLAYING but the
+        # position never advances (no real audio) → must FAIL, not lie success.
+        monkeypatch.setattr(queue_manager, "_PLAYBACK_CONFIRM_TIMEOUT", 0.2)
+        monkeypatch.setattr(queue_manager, "_PLAYBACK_CONFIRM_INTERVAL", 0.01)
+        s = QueueSession(_make_renderer(), _make_tracks(1))
+        s.backend._transport_state = None
+        s.backend.query_playback = AsyncMock(return_value=("PLAYING", 0))  # stuck at 0
+        with pytest.raises(RuntimeError, match="position stuck"):
+            await s._confirm_playback_started("Track 1")
 
     async def test_poll_detects_dead_renderer(self):
-        # Poll reveals the renderer never started (404 stream → STOPPED).
+        # Event-silent renderer whose polled state is a clean STOPPED → fail.
         s = QueueSession(_make_renderer(), _make_tracks(1))
         s.backend._transport_state = None
-        s.backend.query_transport_state = AsyncMock(return_value="STOPPED")
+        s.backend.query_playback = AsyncMock(return_value=("STOPPED", None))
         with pytest.raises(RuntimeError, match="did not start playback"):
             await s._confirm_playback_started("Track 1")
+
+    async def test_event_renderer_is_not_position_polled(self):
+        # Renderers that DO emit events must NOT be position-polled — the evented
+        # PLAYING is trusted directly (per design: poll only the silent ones).
+        s = QueueSession(_make_renderer(), _make_tracks(1))
+        s.backend._transport_state = "PLAYING"
+        s.backend.query_playback = AsyncMock()
+        await s._confirm_playback_started("Track 1")  # no raise
+        s.backend.query_playback.assert_not_awaited()
 
 
 class TestQueryTransportState:

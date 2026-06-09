@@ -153,6 +153,34 @@ class AvTransportBackend(PlaybackBackend):
             return None
         return state
 
+    async def query_playback(self) -> tuple[str | None, int | None]:
+        """One GetTransportInfo+GetPositionInfo refresh; returns (state, pos_s).
+
+        A single ``async_update`` round-trip so the playback-confirm loop can
+        read both the polled TransportState and the position without two device
+        calls (which wouldn't fit the confirm window). ``media_position`` is in
+        seconds (lib may give an int or a timedelta)."""
+        if self._dmr is None:
+            return None, None
+        try:
+            await asyncio.wait_for(
+                self._dmr.async_update(), timeout=_TRANSPORT_POLL_TIMEOUT
+            )
+        except Exception as e:  # noqa: BLE001 - best-effort, like query_transport_state
+            logger.debug(f"[{self.renderer.name}] playback poll refresh failed: {e}")
+        ts = self._dmr.transport_state
+        state = str(getattr(ts, "value", ts) or "").upper() if ts is not None else ""
+        if not state or state == "VENDOR_DEFINED":
+            state = None
+        pos = self._dmr.media_position
+        if pos is None:
+            pos_s: int | None = None
+        elif isinstance(pos, timedelta):
+            pos_s = int(pos.total_seconds())
+        else:
+            pos_s = int(pos)
+        return state, pos_s
+
     async def refresh(self) -> None:
         """Best-effort active poll that updates the cached transport_state.
 
