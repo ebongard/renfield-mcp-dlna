@@ -121,6 +121,18 @@ class PlaybackBackend(ABC):
         renderers that don't emit LAST_CHANGE events). Best-effort: returns
         None on failure rather than raising."""
 
+    async def query_playback(self) -> tuple[str | None, int | None]:
+        """Actively poll BOTH the TransportState and the playback position (in
+        seconds) in a SINGLE device round-trip.
+
+        Used to confirm playback start on **event-silent** renderers (e.g.
+        HiFiBerryOS), where the reported TransportState is unreliable — it has
+        been observed reporting PLAYING while silent and never reporting a clean
+        STOPPED on a failed stream — so an advancing *position* is the only
+        ground truth. Default: unsupported ``(None, None)``; event-emitting
+        backends never reach the position path and need not override this."""
+        return None, None
+
     @abstractmethod
     async def refresh(self) -> None:
         """Poll and update the cached transport_state, leaving the last-known
