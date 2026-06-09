@@ -97,13 +97,20 @@ Source modules under `src/renfield_mcp_dlna/`, layered:
   transport-state + volume, then forwards `(transport_state, current_uri)` to
   `QueueSession._on_transport_event`. `status()` reports the backend's real
   transport state, never "playing" just because a backend is bound. `start()`
-  confirms playback within a timeout, raising on a dead state (404 URL → failure,
-  not false success).
+  confirms playback within a timeout, raising on a dead state (404/500 URL →
+  failure, not false success) — see `_confirm_playback_started` below.
 
 - **Event-silent renderers** (e.g. HiFiBerryOS) never emit `LAST_CHANGE`. The
   backend's `query_transport_state()` actively polls `GetTransportInfo` (bounded
   by `_TRANSPORT_POLL_TIMEOUT`); `get_status` calls `refresh_state()` →
-  `backend.refresh()` first.
+  `backend.refresh()` first. Their *polled* `TransportState` is also unreliable
+  (observed reporting PLAYING while silent, and not reporting a clean STOPPED on
+  a failed stream), so `_confirm_playback_started` does NOT trust it: for an
+  event-silent renderer it confirms via the playback **position advancing**
+  (`backend.query_playback()` → `(state, position)` in one `async_update`),
+  raising on a polled-dead state or a position that never advances. Event-
+  emitting renderers (OpenHome/Sonos) keep the evented-state confirm and are
+  never position-polled.
 
 - **Volume/mute bypass the DmrDevice abstraction** (in `AvTransportBackend`).
   They call `RenderingControl` actions directly (raw 0–100) instead of
