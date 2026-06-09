@@ -41,8 +41,12 @@ from .discovery import DlnaRenderer
 
 logger = logging.getLogger(__name__)
 
-# How long start() waits for the renderer to confirm it began playing.
-_PLAYBACK_CONFIRM_TIMEOUT = 5.0
+# How long start() waits for the renderer to confirm it began playing. Sized so
+# the event-silent position-advance path gets at least two GetPositionInfo reads
+# even when each poll runs near _TRANSPORT_POLL_TIMEOUT (3s) — otherwise a single
+# stuck read could fall through to the lenient branch. Also gives a slow-to-
+# buffer stream room to start advancing before we declare a non-start.
+_PLAYBACK_CONFIRM_TIMEOUT = 8.0
 _PLAYBACK_CONFIRM_INTERVAL = 0.5
 
 # Default control point backing the module-level play_tracks/get_session facade.
@@ -202,10 +206,12 @@ class QueueSession:
         deadline = time.monotonic() + _PLAYBACK_CONFIRM_TIMEOUT
         prev_pos: int | None = None
         positions_seen = 0
+        saw_event = False
         while time.monotonic() < deadline:
             evented = (self.backend.transport_state or "").upper()
             if evented:
                 # Event-emitting renderer → trust the evented state (unchanged).
+                saw_event = True
                 if evented in TRANSPORT_OK:
                     return
                 if evented in TRANSPORT_DEAD:
@@ -228,10 +234,12 @@ class QueueSession:
                     prev_pos = pos
             await asyncio.sleep(_PLAYBACK_CONFIRM_INTERVAL)
 
-        # Timed out. For an event-silent renderer we DID read positions but they
-        # never advanced → a genuine non-start (e.g. an HTTP 500 stream), fail
-        # loudly. Otherwise (no usable signal) stay lenient.
-        if positions_seen >= 2:
+        # Timed out. For a renderer that stayed event-SILENT and gave us positions
+        # which never advanced, that's a genuine non-start (e.g. an HTTP 500
+        # stream) → fail loudly. But if it emitted ANY event (it's alive, just
+        # slow to reach a terminal state, e.g. lingering TRANSITIONING), don't
+        # fail it on stale silent-phase counters — stay lenient.
+        if positions_seen >= 2 and not saw_event:
             raise RuntimeError(
                 f"renderer did not start playback (position stuck at {prev_pos}s); "
                 f"stream may be unreachable: {title}"

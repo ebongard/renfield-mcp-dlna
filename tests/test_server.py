@@ -771,6 +771,25 @@ class TestConfirmPlaybackStarted:
         await s._confirm_playback_started("Track 1")  # no raise
         s.backend.query_playback.assert_not_awaited()
 
+    async def test_event_after_silent_suppresses_stuck_raise(self, monkeypatch):
+        # A renderer that reads as silent+stuck first, then starts emitting a
+        # non-terminal event (TRANSITIONING), is ALIVE — the stale silent-phase
+        # 'stuck' counters must NOT fire a false 'position stuck' failure.
+        monkeypatch.setattr(queue_manager, "_PLAYBACK_CONFIRM_TIMEOUT", 0.3)
+        monkeypatch.setattr(queue_manager, "_PLAYBACK_CONFIRM_INTERVAL", 0.01)
+        s = QueueSession(_make_renderer(), _make_tracks(1))
+        s.backend._transport_state = None
+        calls = {"n": 0}
+
+        async def _qp():
+            calls["n"] += 1
+            if calls["n"] >= 2:
+                s.backend._transport_state = "TRANSITIONING"  # renderer begins eventing
+            return ("PLAYING", 0)  # silent-phase polled state + stuck position
+
+        s.backend.query_playback = _qp
+        await s._confirm_playback_started("Track 1")  # alive → lenient, no raise
+
 
 class TestQueryTransportState:
     """_query_transport_state actively polls GetTransportInfo; refresh_state
